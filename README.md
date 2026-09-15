@@ -349,6 +349,8 @@ Default method: `"arzt"`
 | `"dixon"` | On-line time warping by Dixon (2005) |
 | `"outerhmm"` | Outer-product HMM score follower by Nakamura (2014) |
 | `"skf"` | Switching Kalman Filter with hidden tempo by Jiang and Raphael (2020) |
+| `"oltw_soft"` | Soft on-line time warping with score-informed IMM tempo tracking |
+| `"hierarchical_soft_oltw"` | Hierarchical soft on-line time warping with directed measure graph beam search |
 
 ### MIDI (`input_type="midi"`)
 

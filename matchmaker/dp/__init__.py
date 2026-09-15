@@ -18,3 +18,10 @@ from .oltw_dixon import (
     OnlineTimeWarpingDixonEvent,
     OnlineTimeWarpingDixonFrame,
 )
+from .oltw_soft import (
+    PositionTempoKalman,
+    ScoreInformedIMM,
+    SoftOnlineTimeWarping,
+    SoftOLTWStepDiagnostics,
+)
+from .oltw_hierarchical import HierarchicalSoftOnlineTimeWarping

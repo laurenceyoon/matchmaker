@@ -143,6 +143,14 @@ def _reference_sample_rate(mm) -> int:
     return mm.sample_rate if mm.input_type == "audio" else SAMPLE_RATE
 
 
+@provider("score_graph")
+def _score_graph(mm):
+    """Directed score graph for hierarchical score navigation."""
+    from matchmaker.graph.directed_graph import ScoreDirectedGraphBuilder
+
+    return ScoreDirectedGraphBuilder().build(mm.score_part or mm.score_file)
+
+
 def _onset_pianoroll(mm):
     """``(features, score_positions)`` of the score's onset pianoroll, memoised."""
     cached = getattr(mm, "_onset_pianoroll_cache", None)

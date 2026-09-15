@@ -180,6 +180,30 @@ methods:
         window_size: 10
         frame_rate: 50
 
+    oltw_soft:
+      class: matchmaker.dp:SoftOnlineTimeWarping
+      reference: score_audio
+      args:
+        <<: *oltw_frame_args
+        score_part: {from: score_part}
+      config_passthrough: true
+      default_kwargs:
+        window_size: 10
+        step_size: 3
+
+    hierarchical_soft_oltw:
+      class: matchmaker.dp:HierarchicalSoftOnlineTimeWarping
+      reference: score_audio
+      args:
+        <<: *oltw_frame_args
+        score_part: {from: score_part}
+        score_graph: {from: score_graph}
+      config_passthrough: true
+      default_kwargs:
+        window_size: 10
+        step_size: 3
+        beam_size: 2
+
     outerhmm:
       class: matchmaker.prob:AudioOuterProductHMM
       args:
