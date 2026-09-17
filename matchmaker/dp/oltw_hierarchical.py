@@ -53,6 +53,10 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
         queue: Optional[RECVQueue] = None,
         initial_node: Optional[str] = None,
         boundary_margin_beats: float = 1.0,
+        max_score_step: int = 1,
+        max_time_step: int = 1,
+        gamma_repeat_factor: float = 1.0,
+        gamma_repeat_window_beats: float = 1.5,
         **kwargs,
     ) -> None:
         if ref_frame_to_beat is None and score_positions is not None:
@@ -70,6 +74,10 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
         self.ref_frame_to_beat = np.asarray(ref_frame_to_beat, dtype=float)
         self.score_part = score_part
         self.boundary_margin_beats = boundary_margin_beats
+        self.max_score_step = max_score_step
+        self.max_time_step = max_time_step
+        self.gamma_repeat_factor = gamma_repeat_factor
+        self.gamma_repeat_window_beats = gamma_repeat_window_beats
         self.kwargs = kwargs
 
         self.queue_timeout = QUEUE_TIMEOUT
@@ -91,6 +99,16 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
                 self.node_end_beats[node.node_id] = ordered_nodes[idx + 1].score_beat
             else:
                 self.node_end_beats[node.node_id] = float(self.ref_frame_to_beat[-1])
+
+        repeat_boundaries = []
+        for src_id, edges in self.score_graph.outgoing_edges.items():
+            for edge in edges:
+                if edge.kind.value != "linear":
+                    if src_id in self.node_end_beats:
+                        repeat_boundaries.append(self.node_end_beats[src_id])
+                    if edge.target in self.score_graph.nodes:
+                        repeat_boundaries.append(self.score_graph.nodes[edge.target].score_beat)
+        self.repeat_boundaries = sorted(list(set(repeat_boundaries)))
 
         self.node_start_frames: Dict[str, int] = {
             node.node_id: min(
@@ -116,6 +134,26 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
         self.input_index = 0
 
     def _make_local_follower(self, start_frame: int) -> SoftOnlineTimeWarping:
+        local_kwargs = dict(self.kwargs)
+        for k in (
+            "max_score_step",
+            "max_time_step",
+            "repeat_boundaries",
+            "gamma_repeat_factor",
+            "gamma_repeat_window_beats",
+            "window_size",
+            "step_size",
+            "gamma",
+            "w_horizontal",
+            "obs_var",
+            "use_imm",
+            "score_part",
+            "frame_rate",
+            "ref_frame_to_beat",
+            "queue",
+        ):
+            local_kwargs.pop(k, None)
+
         follower = SoftOnlineTimeWarping(
             reference_features=self.reference_features,
             score_positions=self.score_positions,
@@ -129,7 +167,12 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
             frame_rate=self.frame_rate,
             ref_frame_to_beat=self.ref_frame_to_beat,
             queue=None,
-            **self.kwargs,
+            max_score_step=self.max_score_step,
+            max_time_step=self.max_time_step,
+            repeat_boundaries=self.repeat_boundaries,
+            gamma_repeat_factor=self.gamma_repeat_factor,
+            gamma_repeat_window_beats=self.gamma_repeat_window_beats,
+            **local_kwargs,
         )
         follower._current_frame = start_frame
         follower.current_index = follower._frame_to_score_idx(start_frame)

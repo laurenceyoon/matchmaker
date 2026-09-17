@@ -23,5 +23,8 @@ from .oltw_soft import (
     ScoreInformedIMM,
     SoftOnlineTimeWarping,
     SoftOLTWStepDiagnostics,
+    multi_path_soft_oltw_loop,
 )
 from .oltw_hierarchical import HierarchicalSoftOnlineTimeWarping
+from .oltw_arzt_multi_fold import OnlineTimeWarpingArztMultiFold
+

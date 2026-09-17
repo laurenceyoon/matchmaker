@@ -117,6 +117,112 @@ def weighted_soft_oltw_loop(
     return global_cost_matrix, min_index, min_costs
 
 
+@numba.njit(cache=True)
+def multi_path_soft_oltw_loop(
+    global_cost_matrix: np.ndarray,
+    window_cost: np.ndarray,
+    window_start: int,
+    window_end: int,
+    input_index: int,
+    min_costs: float,
+    min_index: int,
+    gamma_arr: np.ndarray,
+    max_score_step: int = 1,
+    max_time_step: int = 1,
+    w_vertical: float = 1.0,
+    w_horizontal: float = 1.0,
+    w_diagonal: float = 1.0,
+):
+    """Generalized multi-path Soft-OLTW loop considering paths within a window.
+
+    Inspired by Carabias-Orti et al. (ISMIR 2015) Eq. (2), which considers
+    arbitrary step sizes (c_i, c_j) across score and time dimensions.
+    """
+    N = global_cost_matrix.shape[0]
+    num_cols = global_cost_matrix.shape[1]
+    curr_col = num_cols - 1
+
+    idx = 0
+    score_index = window_start
+
+    if score_index == input_index == 0:
+        global_cost_matrix[1, curr_col] = np.sum(window_cost)
+        min_costs = global_cost_matrix[1, curr_col]
+        min_index = 0
+
+    max_candidates = max_score_step + max_time_step + (max_score_step * max_time_step) + 8
+    candidates = np.empty(max_candidates, dtype=np.float64)
+
+    while score_index < window_end:
+        if not (score_index == input_index == 0):
+            local_dist = window_cost[idx]
+            g = gamma_arr[score_index]
+            n_cands = 0
+            curr_s = score_index + 1
+
+            # 1. Vertical steps: same audio frame (curr_col), previous score frames
+            for cs in range(1, max_score_step + 1):
+                prev_s = curr_s - cs
+                if prev_s >= 0:
+                    cost_val = global_cost_matrix[prev_s, curr_col]
+                    if cost_val < np.inf:
+                        candidates[n_cands] = cost_val + w_vertical * local_dist
+                        n_cands += 1
+
+            # 2. Horizontal steps: previous audio frames, same score frame
+            for ct in range(1, max_time_step + 1):
+                prev_col = curr_col - ct
+                if prev_col >= 0 and input_index >= ct:
+                    cost_val = global_cost_matrix[curr_s, prev_col]
+                    if cost_val < np.inf:
+                        candidates[n_cands] = cost_val + w_horizontal * local_dist
+                        n_cands += 1
+
+            # 3. Diagonal / multi-step transitions: previous audio frames, previous score frames
+            for ct in range(1, max_time_step + 1):
+                prev_col = curr_col - ct
+                if prev_col >= 0 and input_index >= ct:
+                    for cs in range(1, max_score_step + 1):
+                        prev_s = curr_s - cs
+                        if prev_s >= 0:
+                            cost_val = global_cost_matrix[prev_s, prev_col]
+                            if cost_val < np.inf:
+                                candidates[n_cands] = cost_val + w_diagonal * local_dist
+                                n_cands += 1
+
+            if n_cands == 0:
+                soft_min_dist = np.inf
+            else:
+                min_val = np.inf
+                for ci in range(n_cands):
+                    if candidates[ci] < min_val:
+                        min_val = candidates[ci]
+                if min_val == np.inf:
+                    soft_min_dist = np.inf
+                else:
+                    exp_sum = 0.0
+                    for ci in range(n_cands):
+                        exp_sum += np.exp(-(candidates[ci] - min_val) / g)
+                    soft_min_dist = min_val - g * np.log(exp_sum + 1e-10)
+
+            global_cost_matrix[curr_s, curr_col] = soft_min_dist
+            norm_cost = soft_min_dist / (input_index + score_index + 1.0)
+            if norm_cost < min_costs:
+                min_costs = norm_cost
+                min_index = score_index
+
+        idx += 1
+        score_index += 1
+
+    for c in range(curr_col):
+        for i in range(N):
+            global_cost_matrix[i, c] = global_cost_matrix[i, c + 1]
+    for i in range(N):
+        global_cost_matrix[i, curr_col] = np.inf
+
+    return global_cost_matrix, min_index, min_costs
+
+
 class PositionTempoKalman:
     """2D Kalman filter tracking score position and tempo."""
 
@@ -420,7 +526,7 @@ class SoftOnlineTimeWarping(OnlineAlignment):
     def __init__(
         self,
         reference_features: NDArray[np.float32],
-        score_positions: NDArray[np.float32],
+        score_positions: Optional[NDArray[np.float32]] = None,
         window_size: int = 10,
         step_size: int = 3,
         gamma: float = DEFAULT_GAMMA,
@@ -435,10 +541,17 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         frame_rate: int = FRAME_RATE,
         ref_frame_to_beat: Optional[NDArray] = None,
         queue: Optional[RECVQueue] = None,
+        max_score_step: int = 1,
+        max_time_step: int = 1,
+        repeat_boundaries: Optional[Any] = None,
+        gamma_repeat_factor: float = 1.0,
+        gamma_repeat_window_beats: float = 1.5,
         **kwargs,
     ) -> None:
         if ref_frame_to_beat is None and score_positions is not None:
             ref_frame_to_beat = score_positions
+        if score_positions is None and ref_frame_to_beat is not None:
+            score_positions = ref_frame_to_beat
 
         super().__init__(
             reference_features=reference_features,
@@ -469,6 +582,18 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         self.use_imm = use_imm
         self.score_part = score_part
 
+        self.max_score_step = max(1, int(max_score_step))
+        self.max_time_step = max(1, int(max_time_step))
+        self.gamma_repeat_factor = float(gamma_repeat_factor)
+        self.gamma_repeat_window_beats = float(gamma_repeat_window_beats)
+
+        if repeat_boundaries is not None:
+            self.repeat_boundaries = list(repeat_boundaries)
+        else:
+            self.repeat_boundaries = self._extract_repeat_boundaries()
+
+        self._init_gamma_array()
+
         if self.use_imm and self.score_part is not None:
             self.kalman = ScoreInformedIMM(
                 score_part=self.score_part,
@@ -479,6 +604,39 @@ class SoftOnlineTimeWarping(OnlineAlignment):
             self.kalman = PositionTempoKalman(obs_var=self._obs_var)
 
         self.reset()
+
+    def _extract_repeat_boundaries(self) -> list:
+        rep_beats: list = []
+        if self.score_part is not None:
+            try:
+                import partitura as pt
+                for r in self.score_part.iter_all(pt.score.Repeat):
+                    if hasattr(r, "start") and r.start is not None and hasattr(r.start, "t"):
+                        rep_beats.append(float(r.start.t))
+                    if hasattr(r, "end") and r.end is not None and hasattr(r.end, "t"):
+                        rep_beats.append(float(r.end.t))
+                for end in self.score_part.iter_all(pt.score.Ending):
+                    if hasattr(end, "start") and end.start is not None and hasattr(end.start, "t"):
+                        rep_beats.append(float(end.start.t))
+            except Exception:
+                pass
+        return sorted(list(set(rep_beats)))
+
+    def _init_gamma_array(self) -> None:
+        self.gamma_arr = np.full(self.N_ref, self.gamma, dtype=np.float64)
+        if self.gamma_repeat_factor == 1.0 or not self.repeat_boundaries or self._ref_frame_to_beat is None:
+            return
+
+        sigma = max(0.1, self.gamma_repeat_window_beats / 2.0)
+        two_sigma_sq = 2.0 * (sigma ** 2)
+        factor_diff = self.gamma_repeat_factor - 1.0
+
+        for frame in range(self.N_ref):
+            beat = self._frame_to_beat(frame)
+            min_dist = min(abs(beat - r_beat) for r_beat in self.repeat_boundaries)
+            if min_dist <= self.gamma_repeat_window_beats * 2.0:
+                mult = 1.0 + factor_diff * np.exp(-(min_dist ** 2) / two_sigma_sq)
+                self.gamma_arr[frame] = float(np.clip(self.gamma * mult, 1e-4, 1.0))
 
     def _init_distance_func(self, distance_func: Union[str, Callable, Tuple[str, Dict[str, Any]]]) -> None:
         if not (isinstance(distance_func, (str, tuple)) or callable(distance_func)):
@@ -518,7 +676,9 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         self.input_index = 0
         self.input_features: list = []
         self._alignment_path = []
-        self.global_cost_matrix = np.full((self.N_ref + 1, 2), np.inf, dtype=np.float32)
+        self.global_cost_matrix = np.full(
+            (self.N_ref + 1, self.max_time_step + 1), np.inf, dtype=np.float64
+        )
         if hasattr(self, "kalman"):
             self.kalman.reset()
         self._pos_history = []
@@ -642,21 +802,43 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         effective_wh = 1.0 + (self.w_horizontal - 1.0) * racing_amount
 
         # Weighted Soft-OLTW DP loop
-        self.global_cost_matrix, min_index, min_costs = weighted_soft_oltw_loop(
-            global_cost_matrix=self.global_cost_matrix,
-            window_cost=window_cost,
-            window_start=window_start,
-            window_end=window_end,
-            input_index=self.input_index,
-            min_costs=min_costs,
-            min_index=min_index,
-            gamma=self.gamma,
-            w_vertical=1.0,
-            w_horizontal=effective_wh,
-            w_diagonal=1.0,
-        )
+        if (
+            self.max_score_step == 1
+            and self.max_time_step == 1
+            and self.gamma_repeat_factor == 1.0
+        ):
+            self.global_cost_matrix, min_index, min_costs = weighted_soft_oltw_loop(
+                global_cost_matrix=self.global_cost_matrix,
+                window_cost=window_cost,
+                window_start=window_start,
+                window_end=window_end,
+                input_index=self.input_index,
+                min_costs=min_costs,
+                min_index=min_index,
+                gamma=self.gamma,
+                w_vertical=1.0,
+                w_horizontal=effective_wh,
+                w_diagonal=1.0,
+            )
+        else:
+            self.global_cost_matrix, min_index, min_costs = multi_path_soft_oltw_loop(
+                global_cost_matrix=self.global_cost_matrix,
+                window_cost=window_cost,
+                window_start=window_start,
+                window_end=window_end,
+                input_index=self.input_index,
+                min_costs=min_costs,
+                min_index=min_index,
+                gamma_arr=self.gamma_arr,
+                max_score_step=self.max_score_step,
+                max_time_step=self.max_time_step,
+                w_vertical=1.0,
+                w_horizontal=effective_wh,
+                w_diagonal=1.0,
+            )
 
         # Update position
+        allowed_step = max(self.step_size, self.max_score_step)
         if self.input_index == 0:
             self._current_frame = min(
                 max(self._current_frame, min_index),
@@ -665,7 +847,7 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         else:
             self._current_frame = min(
                 max(self._current_frame, min_index),
-                self._current_frame + self.step_size,
+                self._current_frame + allowed_step,
             )
         self.current_index = self._frame_to_score_idx(self._current_frame)
         self._pos_history.append(self._current_frame)
