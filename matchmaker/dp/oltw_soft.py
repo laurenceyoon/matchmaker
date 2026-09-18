@@ -30,8 +30,8 @@ from matchmaker.utils.errors import (
 )
 from matchmaker.utils.misc import set_latency_stats
 
-DEFAULT_GAMMA: float = 0.05
-DEFAULT_W_HORIZONTAL: float = 10.0
+DEFAULT_GAMMA: float = 0.08
+DEFAULT_W_HORIZONTAL: float = 1.0
 DEFAULT_OBS_VAR: float = 5.0
 
 
@@ -251,6 +251,9 @@ class PositionTempoKalman:
     def update(self, observed_position: float) -> np.ndarray:
         y = observed_position - float((self.H @ self.state).item())
         S = float((self.H @ self.P @ self.H.T + self.R).item())
+        d_sq = (y ** 2) / max(S, 1e-6)
+        if d_sq > 16.0:
+            y = y * float(np.sqrt(16.0 / d_sq))
         K = (self.P @ self.H.T) / S
         self.state = self.state + K.squeeze() * y
         self.P = (np.eye(2) - np.outer(K.squeeze(), self.H.squeeze())) @ self.P
@@ -490,14 +493,16 @@ class ScoreInformedIMM:
             )
 
         # Active playing: adapt transition based on CA estimated acceleration
+        # Beat-normalized maneuver probability: constant 30% tempo change per beat threshold
         curr_accel = abs(float(self.states[1, 2]))
-        p_maneuver = float(np.clip((curr_accel - 0.012) / 0.025, 0.05, 0.85))
+        delta_v_beat = curr_accel * self.frames_per_beat
+        p_maneuver = float(np.clip((delta_v_beat - 0.30) / 0.625, 0.05, 0.85))
 
         return np.array(
             [
-                [1.0 - p_maneuver - 0.02, p_maneuver, 0.02],
-                [0.40, 0.58, 0.02],
-                [0.30, 0.10, 0.60],
+                [1.0 - p_maneuver - 0.005, p_maneuver, 0.005],
+                [0.25, 0.745, 0.005],
+                [0.60, 0.35, 0.05],
             ]
         )
 
@@ -507,18 +512,30 @@ class ScoreInformedIMM:
         self.c_bar = np.maximum(c_bar, 1e-12)
         omega = (PI * self.mu[:, None]) / self.c_bar[None, :]
 
+        # Tempo memory tracking across pauses/fermatas:
+        # Preserve steady playing velocity before entering pause, and restore it upon resume
+        entering_zv = (self.mu[2] < 0.4) and (self.c_bar[2] >= 0.4)
+        exiting_zv = (self.mu[2] >= 0.4) and (self.c_bar[2] < 0.4)
+        if entering_zv:
+            self.tempo_memory = max(float(self.states[0, 1]), 0.4)
+        elif exiting_zv:
+            self.states[0, 1] = self.tempo_memory
+            self.states[1, 1] = self.tempo_memory
+
         # SKF Insight: Note-length-aware process noise scaling (proportional to local IOI)
         # Fast notes (short IOI) -> high tempo inertia (lower process noise)
         # Long notes (large IOI) -> flexible rubato adaptation (higher process noise)
         ioi_scale = 1.0
-        if len(self.onsets) > 0 and len(self.iois) > 0:
+        if len(self.onsets) > 1 and len(self.iois) > 0:
             if self.r2b is not None and len(self.r2b) > 0:
-                idx = int(np.clip(round(self.position), 0, len(self.r2b) - 1))
-                curr_b = float(self.r2b[idx])
+                pos_idx = int(np.clip(round(self.position), 0, len(self.r2b) - 1))
+                curr_b = float(self.r2b[pos_idx])
             else:
                 curr_b = float(self.position)
             k = int(np.clip(np.searchsorted(self.onsets, curr_b, side="right") - 1, 0, len(self.iois) - 1))
-            ioi_scale = float(np.clip(np.sqrt(self.iois[k]), 0.5, 2.0))
+            ioi_beats = float(self.iois[k])
+            ioi_seconds = ioi_beats * (60.0 / max(self.tempo_bpm, 1.0))
+            ioi_scale = float(np.clip(np.sqrt(ioi_seconds / 0.5), 0.5, 2.0))
 
         Q_scaled = [self.Q[0] * ioi_scale, self.Q[1] * ioi_scale, self.Q[2]]
 
@@ -552,21 +569,29 @@ class ScoreInformedIMM:
     def update(self, z: float) -> np.ndarray:
         z_val = float(z)
         unnorm_mu = np.zeros(3)
+        gamma_gate = 16.0  # 4-sigma gate in 1-DOF chi-squared distribution
+
         for j in range(3):
             y = z_val - float((self.H @ self.states[j]).item())
             S = float((self.H @ self.P_matrices[j] @ self.H.T + self.R).item())
+
+            # 4-sigma innovation gating: softly clamp outlier innovations
+            d_sq = (y ** 2) / max(S, 1e-6)
+            if d_sq > gamma_gate:
+                y = y * float(np.sqrt(gamma_gate / d_sq))
+
             K = (self.P_matrices[j] @ self.H.T) / S
             self.states[j] = self.states[j] + K.squeeze() * y
             I_KH = np.eye(3) - np.outer(K.squeeze(), self.H.squeeze())
             self.P_matrices[j] = I_KH @ self.P_matrices[j]
-            lik = (1.0 / np.sqrt(2.0 * np.pi * S)) * np.exp(-0.5 * (y**2) / S)
+            lik = (1.0 / np.sqrt(2.0 * np.pi * S)) * np.exp(-0.5 * min(d_sq, 25.0))
             unnorm_mu[j] = self.c_bar[j] * max(lik, 1e-12)
 
         sum_unnorm = np.sum(unnorm_mu)
         self.mu = (
             unnorm_mu / sum_unnorm
             if sum_unnorm > 1e-12
-            else np.array([0.7, 0.2, 0.1])
+            else self.c_bar / np.sum(self.c_bar)
         )
         self.mu = np.clip(self.mu, 0.005, 0.99)
         self.mu /= np.sum(self.mu)
@@ -881,33 +906,36 @@ class SoftOnlineTimeWarping(OnlineAlignment):
                 prior_cost = (deviation**2) / (2.0 * effective_sigma**2)
                 window_cost[idx] += self.prior_lambda * prior_cost
 
-        # Tempo-adaptive directional weighting
-        in_zv_pause = (
-            isinstance(self.kalman, ScoreInformedIMM) and self.kalman.mu[2] > 0.5
+        # Tempo-adaptive directional weighting with soft blending
+        mu_zv = (
+            float(self.kalman.mu[2])
+            if isinstance(self.kalman, ScoreInformedIMM)
+            else 0.0
         )
-        if in_zv_pause:
-            wv = 5.0
-            wd = 5.0
-            wh = 1.0
-            effective_wh = 1.0
-            expected_tempo = 0.0
-        else:
-            expected_tempo = 1.0
-            recent_tempo = 1.0
-            if len(self._pos_history) >= 10:
-                lookback = min(30, len(self._pos_history))
-                recent_tempo = (
-                    self._current_frame - self._pos_history[-lookback]
-                ) / lookback
+        zv_factor = float(np.clip((mu_zv - 0.15) / 0.70, 0.0, 1.0))
 
-            racing_scale = 0.35 * max(expected_tempo, 0.1)
-            racing_amount = np.clip(
-                (recent_tempo - expected_tempo) / racing_scale, 0.0, 1.0
-            )
-            effective_wh = 1.0 + (self.w_horizontal - 1.0) * racing_amount
-            wv = 1.0
-            wd = 1.0
-            wh = effective_wh
+        raw_tempo = (
+            float(self.kalman.tempo)
+            if isinstance(self.kalman, (ScoreInformedIMM, PositionTempoKalman))
+            else 1.0
+        )
+        expected_tempo = raw_tempo * (1.0 - zv_factor)
+
+        recent_tempo = 1.0
+        if len(self._pos_history) >= 10:
+            lookback = min(30, len(self._pos_history))
+            recent_tempo = (
+                self._current_frame - self._pos_history[-lookback]
+            ) / lookback
+
+        racing_scale = 0.35 * max(expected_tempo, 0.1)
+        racing_amount = np.clip(
+            (recent_tempo - expected_tempo) / racing_scale, 0.0, 1.0
+        )
+        effective_wh = 1.0 + (self.w_horizontal - 1.0) * racing_amount * (1.0 - zv_factor)
+        wv = 1.0 + 4.0 * zv_factor
+        wd = 1.0 + 4.0 * zv_factor
+        wh = effective_wh
 
         # Weighted Soft-OLTW DP loop
         if (
@@ -960,10 +988,38 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         self.current_index = self._frame_to_score_idx(self._current_frame)
         self._pos_history.append(self._current_frame)
 
-        # Observation update
-        adaptive_R = self._obs_var * np.clip(2.0 / (informativeness + 0.5), 0.2, 10.0)
-        self.kalman.R = np.array([[adaptive_R]])
-        self.kalman.update(float(self._current_frame))
+        # Soft-DTW Gibbs posterior observation extraction over search window:
+        # Under the Gibbs interpretation of Softmin (Cuturi 2017), p(s|t) \propto exp(-D(s,t)/gamma).
+        # We compute posterior mean z_t = E[s] and measurement variance R_t = Var(s).
+        col_idx = self.global_cost_matrix.shape[1] - 2
+        cost_slice = self.global_cost_matrix[window_start + 1 : window_end + 1, col_idx]
+        s_indices = np.arange(window_start, window_end, dtype=np.float64)
+
+        finite_mask = np.isfinite(cost_slice)
+        if np.any(finite_mask):
+            path_lens = self.input_index + s_indices[finite_mask] + 1.0
+            norm_c = cost_slice[finite_mask] / path_lens
+            valid_s = s_indices[finite_mask]
+            min_c = np.min(norm_c)
+            # Rescale excess cost by path length so delta_energy is in raw frame-distance units
+            delta_energy = path_lens * (norm_c - min_c)
+            shift_c = delta_energy / max(self.gamma, 1e-4)
+            gibbs_weights = np.exp(-np.clip(shift_c, 0.0, 50.0))
+            sum_w = np.sum(gibbs_weights)
+            if sum_w > 1e-12:
+                probs = gibbs_weights / sum_w
+                z_t = float(np.sum(valid_s * probs))
+                var_s = float(np.sum(((valid_s - z_t) ** 2) * probs))
+                R_t = max(var_s, self._obs_var)
+            else:
+                z_t = float(min_index)
+                R_t = self._obs_var
+        else:
+            z_t = float(min_index)
+            R_t = self._obs_var
+
+        self.kalman.R = np.array([[R_t]])
+        self.kalman.update(z_t)
 
         # Diagnostics
         selected_offset = self._current_frame - window_start
@@ -1013,8 +1069,8 @@ class SoftOnlineTimeWarping(OnlineAlignment):
             if self.kalman.mu[2] > 0.5:
                 self.expected_advance_rate = 0.0
             else:
-                self.expected_advance_rate = 1.0
+                self.expected_advance_rate = float(self.kalman.tempo)
         else:
-            self.expected_advance_rate = 1.0
+            self.expected_advance_rate = float(expected_tempo)
 
         self.input_index += 1

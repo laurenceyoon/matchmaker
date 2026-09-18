@@ -121,6 +121,84 @@ class TestSoftOnlineTimeWarping(unittest.TestCase):
             imm.update(p)
         self.assertGreater(imm.mu[2], 0.75, "ZV should dominate during pause")
 
+    def test_beat_normalized_dynamics(self):
+        """Verify that acceleration thresholds and pause stay probabilities scale with score tempo."""
+        # 60 BPM -> 50 frames/beat, 120 BPM -> 25 frames/beat, 180 BPM -> 16.67 frames/beat
+        imm60 = ScoreInformedIMM(score_part=None, ref_frame_to_beat=None, tempo=60.0, frame_rate=50)
+        imm120 = ScoreInformedIMM(score_part=None, ref_frame_to_beat=None, tempo=120.0, frame_rate=50)
+        imm180 = ScoreInformedIMM(score_part=None, ref_frame_to_beat=None, tempo=180.0, frame_rate=50)
+
+        self.assertAlmostEqual(imm60.frames_per_beat, 50.0, places=2)
+        self.assertAlmostEqual(imm120.frames_per_beat, 25.0, places=2)
+        self.assertAlmostEqual(imm180.frames_per_beat, 50.0 / 3.0, places=2)
+
+        # Apply same physical acceleration: 30% tempo change per beat
+        # For 60 BPM: a = 0.30 / 50 = 0.006
+        # For 120 BPM: a = 0.30 / 25 = 0.012
+        # For 180 BPM: a = 0.30 / 16.67 = 0.018
+        imm60.states[1, 2] = 0.006
+        imm120.states[1, 2] = 0.012
+        imm180.states[1, 2] = 0.018
+
+        pi60 = imm60.get_dynamic_PI(current_pos_frames=0.0)
+        pi120 = imm120.get_dynamic_PI(current_pos_frames=0.0)
+        pi180 = imm180.get_dynamic_PI(current_pos_frames=0.0)
+
+        # Maneuver probability should be identical at baseline (0.05) across all tempos
+        self.assertAlmostEqual(pi60[0, 1], pi120[0, 1], places=2)
+        self.assertAlmostEqual(pi120[0, 1], pi180[0, 1], places=2)
+        self.assertAlmostEqual(pi60[0, 1], 0.05, places=2)
+
+        # Apply 60% tempo change per beat (delta_v_beat = 0.60): (0.60 - 0.30) / 0.625 = 0.48
+        imm60.states[1, 2] = 0.60 / 50.0
+        imm120.states[1, 2] = 0.60 / 25.0
+        imm180.states[1, 2] = 0.60 / (50.0 / 3.0)
+
+        pi60_acc = imm60.get_dynamic_PI(current_pos_frames=0.0)
+        pi120_acc = imm120.get_dynamic_PI(current_pos_frames=0.0)
+        pi180_acc = imm180.get_dynamic_PI(current_pos_frames=0.0)
+
+        self.assertAlmostEqual(pi60_acc[0, 1], 0.48, places=2)
+        self.assertAlmostEqual(pi120_acc[0, 1], 0.48, places=2)
+        self.assertAlmostEqual(pi180_acc[0, 1], 0.48, places=2)
+
+    def test_active_tempo_coupling_and_advance_rate(self):
+        """Verify that SoftOnlineTimeWarping.step couples expected_tempo to kalman.tempo."""
+        X, Y, _ = generate_example_sequences(
+            lenX=20,
+            centers=3,
+            n_features=3,
+            maxreps=2,
+            minreps=1,
+            noise_scale=0.0,
+            random_state=RNG,
+            dtype=np.float32,
+        )
+        score_positions = np.arange(X.shape[0], dtype=np.float32)
+
+        tracker = SoftOnlineTimeWarping(
+            reference_features=X,
+            score_positions=score_positions,
+            ref_frame_to_beat=score_positions,
+            window_size=5,
+            step_size=2,
+            frame_rate=10,
+            use_imm=False,  # Uses PositionTempoKalman
+        )
+
+        # Artificially set kalman velocity to 1.4 (accelerando)
+        tracker.kalman.state[1] = 1.4
+        # Populate position history to simulate steady velocity of 1.4
+        tracker._music_started = True
+        tracker._current_frame = 14
+        tracker._pos_history = [int(i * 1.4) for i in range(11)]
+
+        tracker.step(Y[0])
+        # Expected advance rate should reflect the kalman tempo (1.4)
+        self.assertAlmostEqual(tracker.expected_advance_rate, 1.4, places=1)
+        # Racing amount should not heavily penalize horizontal transitions
+        self.assertLess(tracker.last_diagnostics.effective_horizontal_weight, 1.5)
+
     def test_tempo_injection_from_matchmaker(self):
         """Verify that Matchmaker passes score tempo to SoftOnlineTimeWarping and ScoreInformedIMM."""
         score_file = EXAMPLE_PIECES["simple_mozart"]["score"]
@@ -139,22 +217,76 @@ class TestSoftOnlineTimeWarping(unittest.TestCase):
         self.assertEqual(mm.score_follower.kalman.tempo_bpm, 144.0)
         self.assertAlmostEqual(mm.score_follower.kalman.frames_per_beat, (mm.frame_rate * 60) / 144.0, places=2)
 
-    def test_continuous_subframe_interpolation(self):
-        """Verify that continuous float frames interpolate smoothly between discrete beat points."""
-        r2b = np.array([0.0, 1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-        tracker = SoftOnlineTimeWarping(
-            reference_features=np.zeros((5, 3), dtype=np.float32),
-            score_positions=r2b,
-            ref_frame_to_beat=r2b,
-            window_size=3,
-            step_size=1,
-            frame_rate=10,
-            use_imm=False,
+    def test_softmin_gibbs_observation(self):
+        """Verify that step computes continuous Gibbs posterior mean and variance."""
+        X, Y, _ = generate_example_sequences(
+            lenX=25,
+            centers=3,
+            n_features=3,
+            maxreps=2,
+            minreps=1,
+            noise_scale=0.0,
+            random_state=RNG,
+            dtype=np.float32,
         )
-        b_half = tracker._frame_to_beat(1.5)
-        self.assertAlmostEqual(b_half, 1.5, places=4)
-        b_quarter = tracker._frame_to_beat(2.25)
-        self.assertAlmostEqual(b_quarter, 2.25, places=4)
+        score_positions = np.arange(X.shape[0], dtype=np.float32)
+
+        tracker = SoftOnlineTimeWarping(
+            reference_features=X,
+            score_positions=score_positions,
+            ref_frame_to_beat=score_positions,
+            window_size=5,
+            step_size=2,
+            frame_rate=10,
+            use_imm=True,
+        )
+        tracker._music_started = True
+
+        for obs in Y[:5]:
+            tracker.step(obs)
+            # Kalman position should be a continuous float
+            self.assertIsInstance(tracker.kalman.position, float)
+            # Kalman observation variance R should be finite and positive
+            self.assertGreaterEqual(float(tracker.kalman.R[0, 0]), tracker._obs_var)
+
+    def test_asymmetric_fermata_and_tempo_memory(self):
+        """Verify that fermata triggers ZV even with active audio, and preserves tempo memory."""
+        imm = ScoreInformedIMM(score_part=None, ref_frame_to_beat=None, tempo=120.0, frame_rate=50)
+        imm.fermata_ranges = [(4.0, 6.0)]
+        imm.pause_ranges = [(4.0, 6.0)]
+        imm.onsets = np.array([0.0, 1.0, 2.0, 3.0, 4.0, 6.0])
+        imm.iois = np.diff(imm.onsets)
+
+        # Steady playing at v = 1.3
+        for i in range(20):
+            imm.states[0, 1] = 1.3
+            imm.predict(is_silent=False)
+            imm.update(float(i * 1.3))
+
+        self.assertGreater(imm.mu[0], 0.4)
+
+        # Enter fermata at beat 4.5: even if is_silent is False (loud sustained chord), ZV must activate
+        pi_fermata = imm.get_dynamic_PI(current_pos_frames=4.5, is_silent=False)
+        self.assertGreater(pi_fermata[0, 2], 0.8, "Fermata with sounding audio must still trigger ZV")
+
+        # Step into pause
+        imm.predict(is_silent=False)
+        self.assertAlmostEqual(imm.tempo_memory, 1.3, places=1, msg="Tempo memory must capture pre-pause velocity")
+
+    def test_innovation_gating(self):
+        """Verify that 4-sigma innovation gating prevents state explosion on extreme outlier observations."""
+        imm = ScoreInformedIMM(score_part=None, ref_frame_to_beat=None, obs_var=1.0)
+        p_init = 10.0
+        imm.reset(position=p_init, tempo=1.0)
+        imm.predict(is_silent=False)
+
+        # Extreme outlier observation: z = 1000.0 (error of 990 frames)
+        state_after = imm.update(1000.0)
+
+        # Without gating, position would jump by hundreds of frames
+        # With 4-sigma gating, position update is bounded
+        self.assertLess(state_after[0], p_init + 50.0, "Innovation gating must prevent massive state jump")
+        self.assertTrue(np.all(np.isfinite(state_after)))
 
 
 if __name__ == "__main__":
