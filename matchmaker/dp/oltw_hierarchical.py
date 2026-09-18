@@ -57,6 +57,7 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
         max_time_step: int = 1,
         gamma_repeat_factor: float = 1.0,
         gamma_repeat_window_beats: float = 1.5,
+        tempo: Optional[float] = None,
         **kwargs,
     ) -> None:
         if ref_frame_to_beat is None and score_positions is not None:
@@ -73,6 +74,7 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
         self.frame_rate = frame_rate
         self.ref_frame_to_beat = np.asarray(ref_frame_to_beat, dtype=float)
         self.score_part = score_part
+        self.tempo = tempo
         self.boundary_margin_beats = boundary_margin_beats
         self.max_score_step = max_score_step
         self.max_time_step = max_time_step
@@ -151,6 +153,7 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
             "frame_rate",
             "ref_frame_to_beat",
             "queue",
+            "tempo",
         ):
             local_kwargs.pop(k, None)
 
@@ -172,6 +175,7 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
             repeat_boundaries=self.repeat_boundaries,
             gamma_repeat_factor=self.gamma_repeat_factor,
             gamma_repeat_window_beats=self.gamma_repeat_window_beats,
+            tempo=self.tempo,
             **local_kwargs,
         )
         follower._current_frame = start_frame

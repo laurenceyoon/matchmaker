@@ -217,6 +217,7 @@ methods:
       args:
         <<: *oltw_frame_args
         score_part: {from: score_part}
+        tempo: {from: tempo}
       config_passthrough: true
       default_kwargs:
         window_size: 10
@@ -229,6 +230,7 @@ methods:
         <<: *oltw_frame_args
         score_part: {from: score_part}
         score_graph: {from: score_graph}
+        tempo: {from: tempo}
       config_passthrough: true
       default_kwargs:
         window_size: 10
