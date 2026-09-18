@@ -284,23 +284,26 @@ class ScoreInformedIMM:
         init_position: float = 0.0,
         init_tempo: float = 1.0,
         obs_var: float = DEFAULT_OBS_VAR,
+        tempo: float = 120.0,
+        frame_rate: int = FRAME_RATE,
     ):
         self.H = np.array([[1.0, 0.0, 0.0]])
         self.R = np.array([[obs_var]])
         self.score_part = score_part
         self.r2b = ref_frame_to_beat
+        self.tempo_bpm = float(tempo)
+        self.frame_rate = int(frame_rate)
+        self.frames_per_beat = (self.frame_rate * 60.0) / max(self.tempo_bpm, 1.0)
 
-        # Extract fermata ranges with tie resolution
+        # Extract fermata ranges: exact start and end of the fermata note
+        # Do NOT walk tie_prev backwards, which would falsely treat earlier bars as fermatas!
         fermatas = (
             list(score_part.iter_all(pt.score.Fermata)) if score_part is not None else []
         )
         self.fermata_ranges = []
         for f in fermatas:
-            curr = f.ref
-            while hasattr(curr, "tie_prev") and curr.tie_prev is not None:
-                curr = curr.tie_prev
             try:
-                start_b = float(score_part.beat_map(curr.start.t))
+                start_b = float(score_part.beat_map(f.ref.start.t))
                 end_b = float(score_part.beat_map(f.ref.end.t))
                 self.fermata_ranges.append((start_b, end_b))
             except Exception:
@@ -328,7 +331,8 @@ class ScoreInformedIMM:
                     last_t = t
             except Exception:
                 pass
-        self.pause_ranges = list(set(self.fermata_ranges + global_rests))
+        self.global_rests = list(set(global_rests))
+        self.pause_ranges = list(set(self.fermata_ranges + self.global_rests))
 
         # Extract onsets and IOIs
         if score_part is not None:
@@ -428,22 +432,51 @@ class ScoreInformedIMM:
             if dist < 0.15:
                 is_at_onset = True
 
-        all_pauses = self.pause_ranges + self.fermata_ranges
-        is_score_pause = (not is_at_onset) and any(
-            s <= curr_beat <= e
-            for s, e in all_pauses
-        )
-        if len(all_pauses) == 0 and len(self.onsets) == 0:
-            is_pause = bool(is_silent)
-        elif is_silent is False:
-            # Active acoustic audio overrides score pause: notes are physically sounding
-            is_pause = False
-        else:
-            # is_silent is True or None (unspecified / score-only query): honor score pause
-            is_pause = is_score_pause
+        matching_fermata = None
+        for s, e in self.fermata_ranges:
+            if s <= curr_beat <= e:
+                matching_fermata = (s, e)
+                break
 
-        if is_pause:
-            # Explicit score pause / rest / fermata (or silent in score-free mode): strongly favor Zero-Velocity mode
+        matching_rest = None
+        for s, e in self.global_rests:
+            if s <= curr_beat <= e:
+                matching_rest = (s, e)
+                break
+
+        # Fermata: sustained sound is expected, active audio does NOT cancel fermata hold
+        if matching_fermata is not None and not is_at_onset:
+            dur_beats = max(matching_fermata[1] - matching_fermata[0], 0.5)
+            n_pause_frames = dur_beats * self.frames_per_beat
+            p_stay = float(np.clip(1.0 - (1.0 / max(n_pause_frames, 10.0)), 0.90, 0.99))
+            p_exit_cv = (1.0 - p_stay) * 0.70
+            p_exit_ca = (1.0 - p_stay) * 0.30
+            return np.array(
+                [
+                    [0.10, 0.05, 0.85],
+                    [0.05, 0.10, 0.85],
+                    [p_exit_cv, p_exit_ca, p_stay],
+                ]
+            )
+
+        # Global rest: silence is expected; active audio overrides rest (early entry)
+        if matching_rest is not None and not is_at_onset:
+            if is_silent is not False:  # True or None (unspecified / score-only query)
+                dur_beats = max(matching_rest[1] - matching_rest[0], 0.5)
+                n_pause_frames = dur_beats * self.frames_per_beat
+                p_stay = float(np.clip(1.0 - (1.0 / max(n_pause_frames, 10.0)), 0.90, 0.99))
+                p_exit_cv = (1.0 - p_stay) * 0.70
+                p_exit_ca = (1.0 - p_stay) * 0.30
+                return np.array(
+                    [
+                        [0.10, 0.05, 0.85],
+                        [0.05, 0.10, 0.85],
+                        [p_exit_cv, p_exit_ca, p_stay],
+                    ]
+                )
+
+        # Score-free synthetic mode: if no score pauses and no score onsets are provided, silence indicates a pause
+        if len(self.pause_ranges) == 0 and len(self.onsets) == 0 and is_silent:
             return np.array(
                 [
                     [0.10, 0.05, 0.85],
@@ -463,9 +496,10 @@ class ScoreInformedIMM:
                 ]
             )
 
-        # Active playing: adapt transition based on CA estimated acceleration
+        # Active playing: adapt transition based on CA estimated acceleration normalized by score tempo
         curr_accel = abs(float(self.states[1, 2]))
-        p_maneuver = float(np.clip((curr_accel - 0.012) / 0.025, 0.05, 0.85))
+        delta_v_beat = curr_accel * self.frames_per_beat
+        p_maneuver = float(np.clip((delta_v_beat - 0.25) / 0.50, 0.05, 0.85))
 
         return np.array(
             [
@@ -481,7 +515,7 @@ class ScoreInformedIMM:
         self.c_bar = np.maximum(c_bar, 1e-12)
         omega = (PI * self.mu[:, None]) / self.c_bar[None, :]
 
-        # SKF Insight: Note-length-aware process noise scaling (proportional to local IOI)
+        # SKF Insight: Note-length-aware process noise scaling (proportional to local IOI in seconds)
         # Fast notes (short IOI) -> high tempo inertia (lower process noise)
         # Long notes (large IOI) -> flexible rubato adaptation (higher process noise)
         ioi_scale = 1.0
@@ -492,7 +526,9 @@ class ScoreInformedIMM:
             else:
                 curr_b = float(self.position)
             k = int(np.clip(np.searchsorted(self.onsets, curr_b, side="right") - 1, 0, len(self.iois) - 1))
-            ioi_scale = float(np.clip(np.sqrt(self.iois[k]), 0.5, 2.0))
+            ioi_beats = float(self.iois[k])
+            ioi_seconds = ioi_beats * (60.0 / max(self.tempo_bpm, 1.0))
+            ioi_scale = float(np.clip(np.sqrt(ioi_seconds / 0.5), 0.5, 2.0))
 
         Q_scaled = [self.Q[0] * ioi_scale, self.Q[1] * ioi_scale, self.Q[2]]
 
@@ -510,8 +546,6 @@ class ScoreInformedIMM:
             self.P_matrices[j] = self.F[j] @ P_mixed[j] @ self.F[j].T + Q_scaled[j]
 
         # Enforce physical constraints:
-        # CV cannot drop to zero velocity (prevents CV from absorbing pauses)
-        self.states[0, 1] = max(0.2, self.states[0, 1])
         # ZV strictly maintains zero velocity and acceleration
         self.states[2, 1] = 0.0
         self.states[2, 2] = 0.0
@@ -546,7 +580,6 @@ class ScoreInformedIMM:
         self.mu /= np.sum(self.mu)
 
         # Enforce physical kinematic constraints post-update:
-        self.states[0, 1] = max(0.2, self.states[0, 1])
         self.states[2, 1] = 0.0
         self.states[2, 2] = 0.0
 
@@ -588,6 +621,7 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         repeat_boundaries: Optional[Any] = None,
         gamma_repeat_factor: float = 1.0,
         gamma_repeat_window_beats: float = 1.5,
+        tempo: float = 120.0,
         **kwargs,
     ) -> None:
         if ref_frame_to_beat is None and score_positions is not None:
@@ -602,6 +636,7 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         )
         self.N_ref: int = self.reference_features.shape[0]
         self.frame_rate = frame_rate
+        self.tempo = float(tempo)
         self._ref_frame_to_beat = ref_frame_to_beat
         self.step_size = step_size
         self._window_size = int(np.round(window_size * self.frame_rate))
@@ -641,6 +676,8 @@ class SoftOnlineTimeWarping(OnlineAlignment):
                 score_part=self.score_part,
                 ref_frame_to_beat=self._ref_frame_to_beat,
                 obs_var=self._obs_var,
+                tempo=self.tempo,
+                frame_rate=self.frame_rate,
             )
         else:
             self.kalman = PositionTempoKalman(obs_var=self._obs_var)
@@ -758,7 +795,8 @@ class SoftOnlineTimeWarping(OnlineAlignment):
     def get_current_position(self) -> float:
         if isinstance(self.kalman, ScoreInformedIMM) and self.input_index > 5:
             k_pos = float(self.kalman.position)
-            if abs(k_pos - self._current_frame) < 3.0:
+            w_start, w_end = self.get_window()
+            if w_start <= k_pos <= w_end:
                 return self._frame_to_beat(k_pos)
         return self._frame_to_beat(self._current_frame)
 
@@ -778,8 +816,6 @@ class SoftOnlineTimeWarping(OnlineAlignment):
             time.time() - t0, self.latency_stats, self.input_index
         )
         return beat
-        self.expected_advance_rate = 1.0
-        self.last_diagnostics = None
 
     def is_still_following(self) -> bool:
         if self.score_positions is not None and len(self.score_positions) > 0:
@@ -845,8 +881,8 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         # Tempo-adaptive directional weighting
         in_zv_pause = isinstance(self.kalman, ScoreInformedIMM) and self.kalman.mu[2] > 0.5
         if in_zv_pause:
-            wv = 5.0
-            wd = 5.0
+            wv = 1.0
+            wd = 1.0
             wh = 1.0
             effective_wh = 1.0
             expected_tempo = 0.0
