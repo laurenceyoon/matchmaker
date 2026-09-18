@@ -226,13 +226,16 @@ class OnlineTimeWarpingArztMultiFold(OnlineAlignment):
             n_uniq = n_sorted[u_first]
 
             # Precompute frame to notated beat directly
-            ref_frame_to_notated_beat = np.interp(
-                ref_frame_to_unfolded_beat,
-                u_uniq,
-                n_uniq,
-                left=n_uniq[0],
-                right=n_uniq[-1],
-            ).astype(np.float32)
+            if len(n_uniq) > 0:
+                ref_frame_to_notated_beat = np.interp(
+                    ref_frame_to_unfolded_beat,
+                    u_uniq,
+                    n_uniq,
+                    left=n_uniq[0],
+                    right=n_uniq[-1],
+                ).astype(np.float32)
+            else:
+                ref_frame_to_notated_beat = ref_frame_to_unfolded_beat.astype(np.float32)
 
             # 4. Instantiate follower
             tracker = OnlineTimeWarpingArztFrame(

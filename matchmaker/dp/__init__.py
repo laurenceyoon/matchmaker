@@ -12,6 +12,7 @@ from .oltw_arzt import (
     OnlineTimeWarpingArzt,
     OnlineTimeWarpingArztEvent,
     OnlineTimeWarpingArztFrame,
+    OnlineTimeWarpingArztTempoFrame,
 )
 from .oltw_dixon import (
     OnlineTimeWarpingDixon,

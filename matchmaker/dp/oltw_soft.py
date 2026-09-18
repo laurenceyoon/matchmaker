@@ -407,7 +407,7 @@ class ScoreInformedIMM:
         self.P = np.diag([10.0, 1.0, 0.01])
 
     def get_dynamic_PI(
-        self, current_pos_frames: float, is_silent: bool = False
+        self, current_pos_frames: float, is_silent: Optional[bool] = None
     ) -> np.ndarray:
         if self.r2b is not None and len(self.r2b) > 0:
             idx = int(np.clip(round(current_pos_frames), 0, len(self.r2b) - 1))
@@ -423,17 +423,37 @@ class ScoreInformedIMM:
                 is_at_onset = True
 
         all_pauses = self.pause_ranges + self.fermata_ranges
-        is_pause = (not is_at_onset) and any(
+        is_score_pause = (not is_at_onset) and any(
             s <= curr_beat <= e
             for s, e in all_pauses
         )
+        if len(all_pauses) == 0 and len(self.onsets) == 0:
+            is_pause = bool(is_silent)
+        elif is_silent is False:
+            # Active acoustic audio overrides score pause: notes are physically sounding
+            is_pause = False
+        else:
+            # is_silent is True or None (unspecified / score-only query): honor score pause
+            is_pause = is_score_pause
 
-        if is_pause or (is_silent and not is_at_onset):
+        if is_pause:
+            # Explicit score pause / rest / fermata (or silent in score-free mode): strongly favor Zero-Velocity mode
             return np.array(
                 [
                     [0.10, 0.05, 0.85],
                     [0.05, 0.10, 0.85],
                     [0.01, 0.01, 0.98],
+                ]
+            )
+
+        if is_silent:
+            # Quiet audio frame during active playing (pianissimo, pedal decay, legato):
+            # Maintain Constant Velocity (CV) tempo inertia; do NOT falsely trigger ZV braking.
+            return np.array(
+                [
+                    [0.94, 0.05, 0.01],
+                    [0.40, 0.59, 0.01],
+                    [0.70, 0.25, 0.05],
                 ]
             )
 
@@ -455,6 +475,21 @@ class ScoreInformedIMM:
         self.c_bar = np.maximum(c_bar, 1e-12)
         omega = (PI * self.mu[:, None]) / self.c_bar[None, :]
 
+        # SKF Insight: Note-length-aware process noise scaling (proportional to local IOI)
+        # Fast notes (short IOI) -> high tempo inertia (lower process noise)
+        # Long notes (large IOI) -> flexible rubato adaptation (higher process noise)
+        ioi_scale = 1.0
+        if len(self.onsets) > 1 and len(self.iois) > 0:
+            if self.r2b is not None and len(self.r2b) > 0:
+                pos_idx = int(np.clip(round(self.position), 0, len(self.r2b) - 1))
+                curr_b = float(self.r2b[pos_idx])
+            else:
+                curr_b = float(self.position)
+            k = int(np.clip(np.searchsorted(self.onsets, curr_b, side="right") - 1, 0, len(self.iois) - 1))
+            ioi_scale = float(np.clip(np.sqrt(self.iois[k]), 0.5, 2.0))
+
+        Q_scaled = [self.Q[0] * ioi_scale, self.Q[1] * ioi_scale, self.Q[2]]
+
         x_mixed = np.zeros((3, 3))
         P_mixed = np.zeros((3, 3, 3))
         for j in range(3):
@@ -466,7 +501,7 @@ class ScoreInformedIMM:
 
         for j in range(3):
             self.states[j] = self.F[j] @ x_mixed[j]
-            self.P_matrices[j] = self.F[j] @ P_mixed[j] @ self.F[j].T + self.Q[j]
+            self.P_matrices[j] = self.F[j] @ P_mixed[j] @ self.F[j].T + Q_scaled[j]
 
         # Enforce physical constraints:
         # CV cannot drop to zero velocity (prevents CV from absorbing pauses)
@@ -787,19 +822,30 @@ class SoftOnlineTimeWarping(OnlineAlignment):
                 window_cost[idx] += self.prior_lambda * prior_cost
 
         # Tempo-adaptive directional weighting
-        expected_tempo = self.expected_advance_rate
-        recent_tempo = expected_tempo
-        if len(self._pos_history) >= 10:
-            lookback = min(30, len(self._pos_history))
-            recent_tempo = (
-                self._current_frame - self._pos_history[-lookback]
-            ) / lookback
+        in_zv_pause = isinstance(self.kalman, ScoreInformedIMM) and self.kalman.mu[2] > 0.5
+        if in_zv_pause:
+            wv = 5.0
+            wd = 5.0
+            wh = 1.0
+            effective_wh = 1.0
+            expected_tempo = 0.0
+        else:
+            expected_tempo = 1.0
+            recent_tempo = 1.0
+            if len(self._pos_history) >= 10:
+                lookback = min(30, len(self._pos_history))
+                recent_tempo = (
+                    self._current_frame - self._pos_history[-lookback]
+                ) / lookback
 
-        racing_scale = 0.35 * max(expected_tempo, 0.1)
-        racing_amount = np.clip(
-            (recent_tempo - expected_tempo) / racing_scale, 0.0, 1.0
-        )
-        effective_wh = 1.0 + (self.w_horizontal - 1.0) * racing_amount
+            racing_scale = 0.35 * max(expected_tempo, 0.1)
+            racing_amount = np.clip(
+                (recent_tempo - expected_tempo) / racing_scale, 0.0, 1.0
+            )
+            effective_wh = 1.0 + (self.w_horizontal - 1.0) * racing_amount
+            wv = 1.0
+            wd = 1.0
+            wh = effective_wh
 
         # Weighted Soft-OLTW DP loop
         if (
@@ -816,9 +862,9 @@ class SoftOnlineTimeWarping(OnlineAlignment):
                 min_costs=min_costs,
                 min_index=min_index,
                 gamma=self.gamma,
-                w_vertical=1.0,
-                w_horizontal=effective_wh,
-                w_diagonal=1.0,
+                w_vertical=wv,
+                w_horizontal=wh,
+                w_diagonal=wd,
             )
         else:
             self.global_cost_matrix, min_index, min_costs = multi_path_soft_oltw_loop(
@@ -832,9 +878,9 @@ class SoftOnlineTimeWarping(OnlineAlignment):
                 gamma_arr=self.gamma_arr,
                 max_score_step=self.max_score_step,
                 max_time_step=self.max_time_step,
-                w_vertical=1.0,
-                w_horizontal=effective_wh,
-                w_diagonal=1.0,
+                w_vertical=wv,
+                w_horizontal=wh,
+                w_diagonal=wd,
             )
 
         # Update position

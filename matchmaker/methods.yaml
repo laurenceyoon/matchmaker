@@ -169,6 +169,18 @@ methods:
         start_window_size: 0.1
         step_size: 3
 
+    arzt_tempo:
+      family: oltw
+      class: matchmaker.dp:OnlineTimeWarpingArztTempoFrame
+      reference: score_audio
+      args: *oltw_frame_args
+      config_passthrough: true
+      default_kwargs:
+        window_size: 10
+        start_window_size: 0.1
+        step_size: 3
+        use_tempo_model: true
+
     arzt_multi_fold:
       family: oltw
       class: matchmaker.dp:OnlineTimeWarpingArztMultiFold
@@ -238,6 +250,21 @@ methods:
         s_j: 0.0
 
     skf:
+      class: matchmaker.prob.skf:SwitchingKalmanFilterFollower
+      args:
+        reference_features: {from: note_array}
+        queue: {from: queue}
+        tempo: {from: tempo}
+        sample_rate: {from: sample_rate}
+        n_fft: {config: n_fft, default: 512}
+        hop_length: {from: hop_length}
+      default_kwargs:
+        processor: raw_spectrum
+        sample_rate: 8000
+        hop_length: 128
+        n_fft: 512
+
+    raphael_ssm:
       class: matchmaker.prob.skf:SwitchingKalmanFilterFollower
       args:
         reference_features: {from: note_array}
