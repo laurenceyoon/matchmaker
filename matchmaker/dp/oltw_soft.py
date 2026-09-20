@@ -275,7 +275,7 @@ class PositionTempoKalman:
 
 
 class ScoreInformedIMM:
-    """Interacting Multiple Model (IMM) filter with score-informed transitions and second-order kinematic state [p, v, a]."""
+    """Interacting Multiple Model (IMM) estimator with score-informed pause transitions."""
 
     def __init__(
         self,
@@ -287,31 +287,26 @@ class ScoreInformedIMM:
         tempo: float = 120.0,
         frame_rate: int = FRAME_RATE,
     ):
-        self.H = np.array([[1.0, 0.0, 0.0]])
-        self.R = np.array([[obs_var]])
+        self.H = np.array([1.0, 0.0, 0.0])
+        self.R = float(obs_var)
         self.score_part = score_part
         self.r2b = ref_frame_to_beat
         self.tempo_bpm = float(tempo)
         self.frame_rate = int(frame_rate)
-        self.frames_per_beat = (self.frame_rate * 60.0) / max(self.tempo_bpm, 1.0)
 
-        # Extract fermata ranges: exact start and end of the fermata note
-        # Do NOT walk tie_prev backwards, which would falsely treat earlier bars as fermatas!
+        # Extract score pause ranges (fermatas and global rests across all voices)
         fermatas = (
             list(score_part.iter_all(pt.score.Fermata)) if score_part is not None else []
         )
-        self.fermata_ranges = []
+        fermata_ranges = []
         for f in fermatas:
             try:
-                start_b = float(score_part.beat_map(f.ref.start.t))
-                end_b = float(score_part.beat_map(f.ref.end.t))
-                self.fermata_ranges.append((start_b, end_b))
+                fermata_ranges.append(
+                    (float(score_part.beat_map(f.ref.start.t)), float(score_part.beat_map(f.ref.end.t)))
+                )
             except Exception:
                 pass
-        self.fermata_ranges = list(set(self.fermata_ranges))
 
-        # Extract true global rests across ALL voices (complete score silence >= 0.5 beats)
-        # Single-voice rests must NOT be treated as pauses because other voices are playing notes!
         global_rests = []
         if score_part is not None:
             try:
@@ -324,44 +319,22 @@ class ScoreInformedIMM:
                 active = 0
                 last_t = 0.0
                 for t, delta in events:
-                    if active == 0 and t > last_t:
-                        if t - last_t >= 0.5:
-                            global_rests.append((last_t, t))
+                    if active == 0 and t > last_t and (t - last_t >= 0.5):
+                        global_rests.append((last_t, t))
                     active += delta
                     last_t = t
             except Exception:
                 pass
-        self.global_rests = list(set(global_rests))
-        self.pause_ranges = list(set(self.fermata_ranges + self.global_rests))
+        self.pause_ranges = list(set(fermata_ranges + global_rests))
 
-        # Extract onsets and IOIs
-        if score_part is not None:
-            try:
-                na = score_part.note_array()
-                unique_onsets = np.unique(na["onset_beat"])
-                self.onsets = unique_onsets
-                self.iois = (
-                    np.diff(unique_onsets) if len(unique_onsets) > 1 else np.array([1.0])
-                )
-            except Exception:
-                self.onsets = np.array([])
-                self.iois = np.array([1.0])
-        else:
-            self.onsets = np.array([])
-            self.iois = np.array([1.0])
-
-        # Kinematic regimes with state vector x = [position, velocity, acceleration]^T:
-        # 0: Constant Velocity (CV) - a = 0, v >= v_min
-        # 1: Constant Acceleration (CA) - second-order dynamics for tempo variations
-        # 2: Zero Velocity (ZV) - stationary regime (v = 0, a = 0) for pauses/rests
-        dt = 1.0  # Normalized frame time step
+        # Kinematic regimes: 0: CV (steady), 1: CA (varying tempo), 2: ZV (pause/rest)
+        dt = 1.0
         self.F = [
             np.array([[1.0, dt, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]]),
             np.array([[1.0, dt, 0.5 * dt**2], [0.0, 1.0, dt], [0.0, 0.0, 1.0]]),
             np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
         ]
-        q_cv = 0.01
-        q_ca = 0.05
+        q_cv, q_ca = 0.01, 0.05
         self.Q = [
             np.diag([q_cv * 0.25, q_cv, 1e-6]),
             np.array([
@@ -369,8 +342,14 @@ class ScoreInformedIMM:
                 [q_ca * (dt**3) / 2, q_ca * (dt**2), q_ca * dt],
                 [q_ca * (dt**2) / 2, q_ca * dt, q_ca],
             ]) + np.diag([1e-4, 1e-4, 1e-4]),
-            np.diag([1e-5, 1e-6, 1e-6]),
+            np.diag([1e-6, 1e-6, 1e-6]),
         ]
+        self.M_play = np.array([[0.95, 0.05, 0.00],
+                                [0.20, 0.80, 0.00],
+                                [0.50, 0.50, 0.00]])
+        self.M_pause = np.array([[0.10, 0.05, 0.85],
+                                 [0.05, 0.10, 0.85],
+                                 [0.02, 0.01, 0.97]])
         self.reset(position=init_position, tempo=init_tempo)
 
     @property
@@ -380,10 +359,6 @@ class ScoreInformedIMM:
     @property
     def tempo(self) -> float:
         return float(self.state[1])
-
-    @property
-    def acceleration(self) -> float:
-        return float(self.state[2])
 
     @property
     def position_uncertainty(self) -> float:
@@ -397,130 +372,51 @@ class ScoreInformedIMM:
         self.mu = np.array([0.7, 0.2, 0.1])
         self.mu_history: list = [tuple(float(x) for x in self.mu)]
         self.c_bar = self.mu.copy()
-        self.states = np.array(
-            [
-                [position, tempo, 0.0],
-                [position, tempo, 0.0],
-                [position, 0.0, 0.0],
-            ],
-            dtype=np.float64,
-        )
-        self.P_matrices = np.array(
-            [
-                np.diag([10.0, 1.0, 0.01]),
-                np.diag([10.0, 3.0, 1.0]),
-                np.diag([10.0, 0.01, 0.01]),
-            ],
-            dtype=np.float64,
-        )
-        self.state = np.array([position, tempo, 0.0], dtype=np.float64)
+        self.states = np.array([
+            [position, tempo, 0.0],
+            [position, tempo, 0.0],
+            [position, 0.0, 0.0],
+        ])
+        self.P_matrices = np.array([
+            np.diag([10.0, 1.0, 0.01]),
+            np.diag([10.0, 3.0, 1.0]),
+            np.diag([10.0, 0.01, 0.01]),
+        ])
+        self.state = np.array([position, tempo, 0.0])
         self.P = np.diag([10.0, 1.0, 0.01])
 
-    def get_dynamic_PI(
-        self, current_pos_frames: float, is_silent: Optional[bool] = None
-    ) -> np.ndarray:
+    def predict(self, is_silent: Optional[bool] = None) -> np.ndarray:
         if self.r2b is not None and len(self.r2b) > 0:
-            idx = int(np.clip(round(current_pos_frames), 0, len(self.r2b) - 1))
+            idx = int(np.clip(round(self.position), 0, len(self.r2b) - 1))
             curr_beat = float(self.r2b[idx])
         else:
-            curr_beat = float(current_pos_frames)
+            curr_beat = float(self.position)
 
-        # Suppress ZV if current score position is close to note onsets
-        is_at_onset = False
-        if len(self.onsets) > 0:
-            dist = np.min(np.abs(self.onsets - curr_beat))
-            if dist < 0.15:
-                is_at_onset = True
-
-        all_pauses = self.pause_ranges + self.fermata_ranges
-        is_score_pause = (not is_at_onset) and any(
-            s <= curr_beat <= e
-            for s, e in all_pauses
+        is_pause = (is_silent is True) or any(
+            s <= curr_beat <= e for s, e in self.pause_ranges
         )
-        if len(all_pauses) == 0 and len(self.onsets) == 0:
-            is_pause = bool(is_silent)
-        elif is_silent is False:
-            # Active acoustic audio overrides score pause: notes are physically sounding
-            is_pause = False
-        else:
-            # is_silent is True or None (unspecified / score-only query): honor score pause
-            is_pause = is_score_pause
+        M = self.M_pause if is_pause else self.M_play
 
-        if is_pause:
-            # Explicit score pause / rest / fermata (or silent in score-free mode): strongly favor Zero-Velocity mode
-            return np.array(
-                [
-                    [0.10, 0.05, 0.85],
-                    [0.05, 0.10, 0.85],
-                    [0.01, 0.01, 0.98],
-                ]
-            )
-
-        if is_silent:
-            # Quiet audio frame during active playing (pianissimo, pedal decay, legato):
-            # Maintain Constant Velocity (CV) tempo inertia; do NOT falsely trigger ZV braking.
-            return np.array(
-                [
-                    [0.94, 0.05, 0.01],
-                    [0.40, 0.59, 0.01],
-                    [0.70, 0.25, 0.05],
-                ]
-            )
-
-        # Active playing: adapt transition based on CA estimated acceleration
-        curr_accel = abs(float(self.states[1, 2]))
-        p_maneuver = float(np.clip((curr_accel - 0.012) / 0.025, 0.05, 0.85))
-
-        return np.array(
-            [
-                [1.0 - p_maneuver - 0.005, p_maneuver, 0.005],
-                [0.25, 0.745, 0.005],
-                [0.60, 0.35, 0.05],
-            ]
-        )
-
-    def predict(self, is_silent: bool = False) -> np.ndarray:
-        PI = self.get_dynamic_PI(self.position, is_silent=is_silent)
-        c_bar = PI.T @ self.mu
+        c_bar = self.mu @ M
         self.c_bar = np.maximum(c_bar, 1e-12)
-        omega = (PI * self.mu[:, None]) / self.c_bar[None, :]
+        omega = (M * self.mu[:, None]) / self.c_bar[None, :]
 
-        # SKF Insight: Note-length-aware process noise scaling (proportional to local IOI)
-        # Fast notes (short IOI) -> high tempo inertia (lower process noise)
-        # Long notes (large IOI) -> flexible rubato adaptation (higher process noise)
-        ioi_scale = 1.0
-        if len(self.onsets) > 1 and len(self.iois) > 0:
-            if self.r2b is not None and len(self.r2b) > 0:
-                pos_idx = int(np.clip(round(self.position), 0, len(self.r2b) - 1))
-                curr_b = float(self.r2b[pos_idx])
-            else:
-                curr_b = float(self.position)
-            k = int(np.clip(np.searchsorted(self.onsets, curr_b, side="right") - 1, 0, len(self.iois) - 1))
-            ioi_scale = float(np.clip(np.sqrt(self.iois[k]), 0.5, 2.0))
-
-        Q_scaled = [self.Q[0] * ioi_scale, self.Q[1] * ioi_scale, self.Q[2]]
-
-        x_mixed = np.zeros((3, 3))
+        x_mixed = omega.T @ self.states
         P_mixed = np.zeros((3, 3, 3))
         for j in range(3):
             for i in range(3):
-                x_mixed[j] += omega[i, j] * self.states[i]
-            for i in range(3):
-                dx = self.states[i] - x_mixed[j]
-                P_mixed[j] += omega[i, j] * (self.P_matrices[i] + np.outer(dx, dx))
+                y = self.states[i] - x_mixed[j]
+                P_mixed[j] += omega[i, j] * (self.P_matrices[i] + np.outer(y, y))
 
         for j in range(3):
             self.states[j] = self.F[j] @ x_mixed[j]
-            self.P_matrices[j] = self.F[j] @ P_mixed[j] @ self.F[j].T + Q_scaled[j]
+            self.P_matrices[j] = self.F[j] @ P_mixed[j] @ self.F[j].T + self.Q[j]
 
-        # Enforce physical constraints:
-        # CV cannot drop to zero velocity (prevents CV from absorbing pauses)
         self.states[0, 1] = max(0.2, self.states[0, 1])
-        # ZV strictly maintains zero velocity and acceleration
         self.states[2, 1] = 0.0
         self.states[2, 2] = 0.0
 
-        self.state = np.sum(self.c_bar[:, None] * self.states, axis=0)
+        self.state = self.c_bar @ self.states
         self.P = np.zeros((3, 3))
         for j in range(3):
             dx = self.states[j] - self.state
@@ -529,37 +425,27 @@ class ScoreInformedIMM:
 
     def update(self, z: float) -> np.ndarray:
         z_val = float(z)
-        unnorm_mu = np.zeros(3)
+        lik = np.zeros(3)
         for j in range(3):
-            y = z_val - float((self.H @ self.states[j]).item())
-            S = float((self.H @ self.P_matrices[j] @ self.H.T + self.R).item())
-            K = (self.P_matrices[j] @ self.H.T) / S
-            self.states[j] = self.states[j] + K.squeeze() * y
-            I_KH = np.eye(3) - np.outer(K.squeeze(), self.H.squeeze())
-            self.P_matrices[j] = I_KH @ self.P_matrices[j]
-            lik = (1.0 / np.sqrt(2.0 * np.pi * S)) * np.exp(-0.5 * (y**2) / S)
-            unnorm_mu[j] = self.c_bar[j] * max(lik, 1e-12)
+            y = z_val - np.dot(self.H, self.states[j])
+            S = np.dot(self.H, self.P_matrices[j] @ self.H) + self.R
+            K = (self.P_matrices[j] @ self.H) / S
+            self.states[j] += K * y
+            self.P_matrices[j] -= np.outer(K, self.H) @ self.P_matrices[j]
+            lik[j] = (1.0 / np.sqrt(2.0 * np.pi * S)) * np.exp(-0.5 * (y**2) / S)
 
-        sum_unnorm = np.sum(unnorm_mu)
-        self.mu = (
-            unnorm_mu / sum_unnorm
-            if sum_unnorm > 1e-12
-            else self.c_bar / np.sum(self.c_bar)
-        )
-        self.mu = np.clip(self.mu, 0.005, 0.99)
-        self.mu /= np.sum(self.mu)
+        unnorm_mu = self.c_bar * np.maximum(lik, 1e-12)
+        self.mu = unnorm_mu / np.sum(unnorm_mu)
 
-        # Enforce physical kinematic constraints post-update:
         self.states[0, 1] = max(0.2, self.states[0, 1])
         self.states[2, 1] = 0.0
         self.states[2, 2] = 0.0
 
-        self.state = np.sum(self.mu[:, None] * self.states, axis=0)
+        self.state = self.mu @ self.states
         self.P = np.zeros((3, 3))
         for j in range(3):
             dx = self.states[j] - self.state
             self.P += self.mu[j] * (self.P_matrices[j] + np.outer(dx, dx))
-        self.state[1] = np.clip(self.state[1], 0.0, 10.0)
         self.mu_history.append(tuple(float(x) for x in self.mu))
         return self.state.copy()
 
@@ -765,18 +651,9 @@ class SoftOnlineTimeWarping(OnlineAlignment):
 
     def get_current_position(self) -> float:
         if isinstance(self.kalman, ScoreInformedIMM) and self.input_index > 5:
-            k_pos = float(self.kalman.position)
-            z_t = float(self._current_frame)
-            P_00 = float(self.kalman.P[0, 0])
-            R_t = (
-                float(self.kalman.R[0, 0])
-                if hasattr(self.kalman, "R")
-                else self._obs_var
-            )
-            variance = max(P_00 + R_t, 1.0)
-            w = float(np.exp(-0.5 * ((k_pos - z_t) ** 2) / variance))
-            fused_frame = w * k_pos + (1.0 - w) * z_t
-            return self._frame_to_beat(fused_frame)
+            if self.kalman.mu[2] > 0.5:
+                return self._frame_to_beat(float(self.kalman.position))
+            return self._frame_to_beat(self._current_frame)
         return self._frame_to_beat(self._current_frame)
 
     def get_window(self) -> Tuple[int, int]:
@@ -804,84 +681,45 @@ class SoftOnlineTimeWarping(OnlineAlignment):
     def step(self, input_features: NDArray[np.float32]) -> None:
         feat = input_features.squeeze()
 
-        # Pre-music silence detection
+        # Lead-in silence gating: wait for first audio onset before advancing
         feat_abs = np.abs(feat)
         peakiness = float(np.max(feat_abs)) / (float(np.mean(feat_abs)) + 1e-10)
-        is_uninformative = peakiness < 2.0
-
         if not self._music_started:
-            if is_uninformative:
+            if peakiness < 2.0:
                 self._pos_history.append(self._current_frame)
                 return
             self._music_started = True
 
-        # Kalman / IMM prediction
-        if isinstance(self.kalman, ScoreInformedIMM):
-            predicted_state = self.kalman.predict(is_silent=is_uninformative)
-        else:
-            predicted_state = self.kalman.predict()
-        predicted_pos = predicted_state[0]
-        pos_uncertainty = self.kalman.position_uncertainty
-        effective_sigma = self.prior_sigma + pos_uncertainty
+        # IMM / Kalman prediction
+        self.kalman.predict()
 
-        # Compute window local distances
+        # Window local distances
         min_costs = np.inf
         min_index = max(self.window_index - self.step_size, 0)
         window_start, window_end = self.get_window()
-        raw_window_cost = self.vdist(
+        window_cost = self.vdist(
             self.reference_features[window_start:window_end],
             feat,
             self.distance_func,
         )
-        window_cost = raw_window_cost.copy()
 
-        # Cost informativeness
-        cost_range = (
-            float(np.max(window_cost) - np.min(window_cost))
-            if len(window_cost) > 1
-            else 0.0
+        # Directional weighting: penalize horizontal stalling when tracker is active
+        expected_tempo = 1.0
+        recent_tempo = 1.0
+        if len(self._pos_history) >= 10:
+            lookback = min(30, len(self._pos_history))
+            recent_tempo = (
+                self._current_frame - self._pos_history[-lookback]
+            ) / lookback
+
+        racing_scale = 0.35 * max(expected_tempo, 0.1)
+        racing_amount = np.clip(
+            (recent_tempo - expected_tempo) / racing_scale, 0.0, 1.0
         )
-        cost_med = float(np.median(window_cost)) if len(window_cost) > 0 else 1.0
-        informativeness = cost_range / (cost_med + 1e-10)
-
-        # Cost-adaptive prior
-        if (
-            self.prior_lambda > 0
-            and self.input_index > 30
-            and pos_uncertainty < effective_sigma * 0.5
-            and informativeness > 0.5
-        ):
-            for idx in range(len(window_cost)):
-                score_idx = window_start + idx
-                deviation = score_idx - predicted_pos
-                prior_cost = (deviation**2) / (2.0 * effective_sigma**2)
-                window_cost[idx] += self.prior_lambda * prior_cost
-
-        # Tempo-adaptive directional weighting
-        in_zv_pause = isinstance(self.kalman, ScoreInformedIMM) and self.kalman.mu[2] > 0.5
-        if in_zv_pause:
-            wv = 5.0
-            wd = 5.0
-            wh = 1.0
-            effective_wh = 1.0
-            expected_tempo = 0.0
-        else:
-            expected_tempo = 1.0
-            recent_tempo = 1.0
-            if len(self._pos_history) >= 10:
-                lookback = min(30, len(self._pos_history))
-                recent_tempo = (
-                    self._current_frame - self._pos_history[-lookback]
-                ) / lookback
-
-            racing_scale = 0.35 * max(expected_tempo, 0.1)
-            racing_amount = np.clip(
-                (recent_tempo - expected_tempo) / racing_scale, 0.0, 1.0
-            )
-            effective_wh = 1.0 + (self.w_horizontal - 1.0) * racing_amount
-            wv = 1.0
-            wd = 1.0
-            wh = effective_wh
+        effective_wh = 1.0 + (self.w_horizontal - 1.0) * racing_amount
+        wv = 1.0
+        wd = 1.0
+        wh = effective_wh
 
         # Weighted Soft-OLTW DP loop
         if (
@@ -934,27 +772,9 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         self.current_index = self._frame_to_score_idx(self._current_frame)
         self._pos_history.append(self._current_frame)
 
-        # Observation update
-        adaptive_R = self._obs_var * np.clip(2.0 / (informativeness + 0.5), 0.2, 10.0)
-        self.kalman.R = np.array([[adaptive_R]])
+        # IMM observation update
         self.kalman.update(float(self._current_frame))
 
-        # Diagnostics
-        selected_offset = self._current_frame - window_start
-        selected_local_cost = (
-            float(raw_window_cost[selected_offset])
-            if 0 <= selected_offset < len(raw_window_cost)
-            else None
-        )
-        sorted_local_costs = np.sort(raw_window_cost)
-        best_local_cost = (
-            float(sorted_local_costs[0]) if len(sorted_local_costs) else None
-        )
-        local_cost_margin = (
-            float(sorted_local_costs[1] - sorted_local_costs[0])
-            if len(sorted_local_costs) > 1
-            else None
-        )
         mu_val = (
             tuple(float(x) for x in self.kalman.mu)
             if isinstance(self.kalman, ScoreInformedIMM)
@@ -968,25 +788,20 @@ class SoftOnlineTimeWarping(OnlineAlignment):
             score_beat=self.get_current_position(),
             window_start=window_start,
             window_end=window_end,
-            predicted_position=float(predicted_pos),
-            position_uncertainty=float(pos_uncertainty),
-            normalized_path_cost=(float(min_costs) if np.isfinite(min_costs) else None),
-            selected_local_cost=selected_local_cost,
-            best_local_cost=best_local_cost,
-            median_local_cost=cost_med,
-            local_cost_margin=local_cost_margin,
-            informativeness=informativeness,
-            effective_horizontal_weight=float(effective_wh),
-            expected_advance_rate=float(expected_tempo),
-            is_informative=not is_uninformative,
+            predicted_position=float(self.kalman.position),
+            position_uncertainty=float(self.kalman.position_uncertainty),
+            normalized_path_cost=(
+                float(min_costs) if np.isfinite(min_costs) else None
+            ),
+            selected_local_cost=None,
+            best_local_cost=None,
+            median_local_cost=None,
+            local_cost_margin=None,
+            informativeness=1.0,
+            effective_horizontal_weight=float(wh),
+            expected_advance_rate=float(self.kalman.tempo),
+            is_informative=True,
             mode_probabilities=mu_val,
         )
-
-        # Dynamic acoustic unfreezing for IMM: release braking upon next note arrival
-        if isinstance(self.kalman, ScoreInformedIMM):
-            if self.kalman.mu[2] > 0.5:
-                self.expected_advance_rate = 0.0
-            else:
-                self.expected_advance_rate = 1.0
 
         self.input_index += 1
