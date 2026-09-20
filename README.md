@@ -349,8 +349,15 @@ Default method: `"arzt"`
 | `"dixon"` | On-line time warping by Dixon (2005) |
 | `"outerhmm"` | Outer-product HMM score follower by Nakamura (2014) |
 | `"skf"` | Switching Kalman Filter with hidden tempo by Jiang and Raphael (2020) |
-| `"oltw_soft"` | Soft on-line time warping with score-informed IMM tempo tracking |
+| `"softoltw"` | Soft on-line time warping with path-conditioned Kalman tempo estimates and score-informed IMM output filtering |
+| `"softoltw_no_imm"` | Soft on-line time warping without Kalman path inference or IMM filtering |
 | `"hierarchical_soft_oltw"` | Hierarchical soft on-line time warping with directed measure graph beam search |
+
+SoftOLTW's frame alignment lives in `matchmaker/dp/oltw_soft.py`, the
+path-conditioned Kalman lattice in `matchmaker/dp/kalman_path.py`, and the
+score-informed IMM in `matchmaker/prob/imm.py`. The hierarchical follower
+composes local SoftOLTW followers for its graph hypotheses. The legacy
+`"oltw_soft"` registration retains output IMM filtering without the Kalman lattice.
 
 ### MIDI (`input_type="midi"`)
 

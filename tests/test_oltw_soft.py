@@ -9,7 +9,6 @@ import numpy as np
 
 from matchmaker import EXAMPLE_PIECES, Matchmaker
 from matchmaker.dp.oltw_soft import (
-    PositionTempoKalman,
     ScoreInformedIMM,
     SoftOnlineTimeWarping,
 )
@@ -181,6 +180,24 @@ class TestSoftOnlineTimeWarping(unittest.TestCase):
         self.assertAlmostEqual(b_half, 1.5, places=4)
         b_quarter = tracker._frame_to_beat(2.25)
         self.assertAlmostEqual(b_quarter, 2.25, places=4)
+
+
+def test_baseline_constructs_no_kalman_models(monkeypatch):
+    import matchmaker.dp.oltw_soft as module
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Baseline must not construct Kalman models")
+
+    monkeypatch.setattr(module, "ScoreInformedIMM", forbidden)
+    monkeypatch.setattr(module, "KalmanPathLattice", forbidden)
+    monkeypatch.setattr(module, "score_position_variance", forbidden)
+    reference = np.eye(12, dtype=np.float32)
+    follower = SoftOnlineTimeWarping(reference, use_imm=False, path_tempo=True)
+    for feature in reference:
+        follower.step(feature)
+    follower.reset()
+    assert follower.kalman is None
+    assert follower.path_lattice is None
 
 
 if __name__ == "__main__":

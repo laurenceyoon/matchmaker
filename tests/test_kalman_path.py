@@ -1,5 +1,5 @@
 import numpy as np
-from matchmaker.dp.oltw_soft import KalmanPathLattice
+from matchmaker.dp.kalman_path import KalmanPathLattice
 
 
 def test_path_mixture_matches_scalar_branch_enumeration():

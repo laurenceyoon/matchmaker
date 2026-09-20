@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.linalg import expm
-from matchmaker.dp.oltw_soft import ScoreInformedIMM
+from matchmaker.prob.imm import ScoreInformedIMM
 
 
 def test_continuous_time_model_is_invariant_to_frame_subdivision():
@@ -96,7 +96,7 @@ def test_score_repeated_chord_duration_defines_uncertainty():
 
 
 def test_correlated_observation_update_matches_scalar_kalman_reference():
-    imm = ScoreInformedIMM(single_model=True)
+    imm = ScoreInformedIMM()
     imm.set_observation_error(4.0, initialize=True)
     imm.predict()
     state, covariance = imm.states[0].copy(), imm.P_matrices[0].copy()
@@ -108,8 +108,8 @@ def test_correlated_observation_update_matches_scalar_kalman_reference():
     residual = np.eye(4) - np.outer(gain, imm.H)
     expected_covariance = residual @ covariance @ residual.T + imm.R * np.outer(gain, gain)
     imm.update(observation)
-    np.testing.assert_allclose(imm.state, expected_state)
-    np.testing.assert_allclose(imm.P, expected_covariance)
+    np.testing.assert_allclose(imm.states[0], expected_state)
+    np.testing.assert_allclose(imm.P_matrices[0], expected_covariance)
 
 
 def test_observation_error_preserves_stationary_variance_without_measurements():

@@ -34,7 +34,6 @@ class GraphHypothesis:
 
 
 class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
-    """Hierarchical score follower with Measure Graph Beam Search (K=2) and 3-Regime IMM."""
 
     def __init__(
         self,
@@ -53,11 +52,7 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
         queue: Optional[RECVQueue] = None,
         initial_node: Optional[str] = None,
         boundary_margin_beats: float = 1.0,
-        max_score_step: int = 1,
-        max_time_step: int = 1,
-        gamma_repeat_factor: float = 1.0,
-        gamma_repeat_window_beats: float = 1.5,
-        tempo: Optional[float] = None,
+        tempo: float = 120.0,
         **kwargs,
     ) -> None:
         if ref_frame_to_beat is None and score_positions is not None:
@@ -66,21 +61,14 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
         super().__init__(reference_features=reference_features, score_positions=score_positions, queue=queue)
         self.score_graph = score_graph
         self.beam_size = max(1, beam_size)
-        self.gamma = gamma
-        self.w_horizontal = w_horizontal
-        self.obs_var = obs_var
-        self.window_size = window_size
-        self.step_size = step_size
-        self.frame_rate = frame_rate
         self.ref_frame_to_beat = np.asarray(ref_frame_to_beat, dtype=float)
-        self.score_part = score_part
-        self.tempo = tempo
         self.boundary_margin_beats = boundary_margin_beats
-        self.max_score_step = max_score_step
-        self.max_time_step = max_time_step
-        self.gamma_repeat_factor = gamma_repeat_factor
-        self.gamma_repeat_window_beats = gamma_repeat_window_beats
-        self.kwargs = kwargs
+        self.local_options = dict(
+            kwargs, window_size=window_size, step_size=step_size,
+            gamma=gamma, w_horizontal=w_horizontal, obs_var=obs_var,
+            use_imm=True, score_part=score_part, frame_rate=frame_rate,
+            ref_frame_to_beat=self.ref_frame_to_beat, tempo=tempo,
+        )
 
         self.queue_timeout = QUEUE_TIMEOUT
         self.latency_stats: Dict[str, float] = {
@@ -101,16 +89,6 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
                 self.node_end_beats[node.node_id] = ordered_nodes[idx + 1].score_beat
             else:
                 self.node_end_beats[node.node_id] = float(self.ref_frame_to_beat[-1])
-
-        repeat_boundaries = []
-        for src_id, edges in self.score_graph.outgoing_edges.items():
-            for edge in edges:
-                if edge.kind.value != "linear":
-                    if src_id in self.node_end_beats:
-                        repeat_boundaries.append(self.node_end_beats[src_id])
-                    if edge.target in self.score_graph.nodes:
-                        repeat_boundaries.append(self.score_graph.nodes[edge.target].score_beat)
-        self.repeat_boundaries = sorted(list(set(repeat_boundaries)))
 
         self.node_start_frames: Dict[str, int] = {
             node.node_id: min(
@@ -136,47 +114,10 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
         self.input_index = 0
 
     def _make_local_follower(self, start_frame: int) -> SoftOnlineTimeWarping:
-        local_kwargs = dict(self.kwargs)
-        for k in (
-            "max_score_step",
-            "max_time_step",
-            "repeat_boundaries",
-            "gamma_repeat_factor",
-            "gamma_repeat_window_beats",
-            "window_size",
-            "step_size",
-            "gamma",
-            "w_horizontal",
-            "obs_var",
-            "use_imm",
-            "score_part",
-            "frame_rate",
-            "ref_frame_to_beat",
-            "queue",
-            "tempo",
-        ):
-            local_kwargs.pop(k, None)
-
         follower = SoftOnlineTimeWarping(
             reference_features=self.reference_features,
             score_positions=self.score_positions,
-            window_size=self.window_size,
-            step_size=self.step_size,
-            gamma=self.gamma,
-            w_horizontal=self.w_horizontal,
-            obs_var=self.obs_var,
-            use_imm=True,
-            score_part=self.score_part,
-            frame_rate=self.frame_rate,
-            ref_frame_to_beat=self.ref_frame_to_beat,
-            queue=None,
-            max_score_step=self.max_score_step,
-            max_time_step=self.max_time_step,
-            repeat_boundaries=self.repeat_boundaries,
-            gamma_repeat_factor=self.gamma_repeat_factor,
-            gamma_repeat_window_beats=self.gamma_repeat_window_beats,
-            tempo=self.tempo,
-            **local_kwargs,
+            **self.local_options,
         )
         follower._current_frame = start_frame
         follower.current_index = follower._frame_to_score_idx(start_frame)
@@ -187,11 +128,9 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
         target_frame = self.node_start_frames[target_node_id]
         child_follower = self._make_local_follower(target_frame)
 
-        if hasattr(parent.follower, "kalman") and hasattr(child_follower, "kalman"):
-            p_imm, c_imm = parent.follower.kalman, child_follower.kalman
-            if hasattr(p_imm, "states") and hasattr(c_imm, "states"):
-                c_imm.states[:, 1] = p_imm.states[:, 1]
-                c_imm.mu = p_imm.mu.copy()
+        p_imm, c_imm = parent.follower.kalman, child_follower.kalman
+        c_imm.states[:, 1] = p_imm.states[:, 1]
+        c_imm.mu = p_imm.mu.copy()
 
         new_jumps = dict(parent.jump_counts)
         jump_key = f"{parent.node_id}->{target_node_id}"
@@ -213,10 +152,6 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
             hyp.follower.step(features)
             current_beat = hyp.follower.get_current_position()
             hyp.last_score_beat = current_beat
-
-            diag = hyp.follower.last_diagnostics
-            if diag is not None and diag.selected_local_cost is not None:
-                hyp.log_weight += -float(diag.selected_local_cost) / max(self.gamma * 2.0, 0.05)
 
             new_hypotheses.append(hyp)
 
