@@ -41,7 +41,7 @@ from matchmaker.utils.misc import generate_score_audio, set_latency_stats
 from partitura.io.exportmidi import get_ppq
 
 
-class OnlineTimeWarpingArztMultiFold(OnlineAlignment):
+class OnlineTimeWarpingArztMultiFold(OnlineTimeWarpingArztFrame):
     """Multi-fold parallel OLTW tracker for folded scores with repeats.
 
     Parameters
@@ -116,14 +116,28 @@ class OnlineTimeWarpingArztMultiFold(OnlineAlignment):
         }
         notated_positions = np.unique(folded_notes["onset_beat"]).astype(np.float32)
 
+        ref_feat = (
+            reference_features
+            if reference_features is not None
+            else np.empty((0, 12), dtype=np.float32)
+        )
+        dummy_ref_beat = (
+            ref_frame_to_beat
+            if ref_frame_to_beat is not None
+            else np.zeros(max(1, len(ref_feat)), dtype=np.float32)
+        )
+
         super().__init__(
-            reference_features=(
-                reference_features
-                if reference_features is not None
-                else np.empty((0, 12), dtype=np.float32)
-            ),
+            reference_features=ref_feat,
             score_positions=notated_positions,
+            window_size=window_size,
+            step_size=step_size,
+            start_window_size=start_window_size,
+            distance_func=distance_func,
+            frame_rate=frame_rate,
+            ref_frame_to_beat=dummy_ref_beat,
             queue=queue,
+            **kwargs,
         )
 
         # Build parallel track hypotheses from score repeat structure

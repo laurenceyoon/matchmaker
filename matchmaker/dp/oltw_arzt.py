@@ -138,11 +138,6 @@ class OnlineTimeWarpingArztFrame(OnlineTimeWarpingArzt):
         frame_rate: int = FRAME_RATE,
         ref_frame_to_beat: NDArray = None,
         queue: Optional[RECVQueue] = None,
-        use_tempo_model: bool = False,
-        tempo_window_size: float = 3.0,
-        tempo_min_past: float = 1.0,
-        tempo_n_onsets: int = 20,
-        random_seed: Optional[int] = 1984,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -159,17 +154,10 @@ class OnlineTimeWarpingArztFrame(OnlineTimeWarpingArzt):
                 "Frame-level Arzt requires `ref_frame_to_beat` (per-frame beat mapping)."
             )
         self.frame_rate = frame_rate
-        self._original_reference_features = reference_features.copy()
-        self._original_ref_frame_to_beat = ref_frame_to_beat.copy()
         self._ref_frame_to_beat = ref_frame_to_beat
         self._window_size = int(np.round(window_size * self.frame_rate))
         self._start_window_size = int(np.round(start_window_size * frame_rate))
         self.queue_timeout = QUEUE_TIMEOUT
-        self.use_tempo_model = use_tempo_model
-        self.tempo_window_size = tempo_window_size
-        self.tempo_min_past = tempo_min_past
-        self.tempo_n_onsets = tempo_n_onsets
-        self.random_seed = random_seed
         self.latency_stats: Dict[str, float] = {
             "total_latency": 0,
             "total_frames": 0,
@@ -177,7 +165,6 @@ class OnlineTimeWarpingArztFrame(OnlineTimeWarpingArzt):
             "min_latency": float("inf"),
         }
         self._init_distance_func(distance_func)
-        self.reset()
 
     def __call__(self, observation: Any, perf_time: float) -> float:
         t0 = time.time()
@@ -192,39 +179,6 @@ class OnlineTimeWarpingArztFrame(OnlineTimeWarpingArzt):
         super().reset()
         self.input_features: list = []
         self._current_frame = 0
-        self.current_relative_tempo: float = 1.0
-        self._consecutive_alterations: int = 0
-        self._backpointers: list = []
-        seed = getattr(self, "random_seed", 1984)
-        self._rng = np.random.RandomState(seed)
-        if (
-            hasattr(self, "_original_reference_features")
-            and self._original_reference_features is not None
-        ):
-            self.reference_features = self._original_reference_features.copy()
-            self._ref_frame_to_beat = self._original_ref_frame_to_beat.copy()
-            self.N_ref = self.reference_features.shape[0]
-            self.global_cost_matrix = np.full(
-                (self.N_ref + 1, 2), np.inf, dtype=np.float32
-            )
-        self._init_onset_mask()
-
-    def _init_onset_mask(self) -> None:
-        if not hasattr(self, "N_ref"):
-            return
-        self.is_onset_frame = np.zeros(self.N_ref, dtype=bool)
-        if (
-            hasattr(self, "score_positions")
-            and self.score_positions is not None
-            and len(self.score_positions) > 0
-            and hasattr(self, "_ref_frame_to_beat")
-            and self._ref_frame_to_beat is not None
-        ):
-            onset_frames = np.searchsorted(
-                self._ref_frame_to_beat, self.score_positions
-            )
-            valid = onset_frames < self.N_ref
-            self.is_onset_frame[onset_frames[valid]] = True
 
     @property
     def window_index(self) -> int:
@@ -288,6 +242,125 @@ class OnlineTimeWarpingArztFrame(OnlineTimeWarpingArzt):
         start = max(self.window_index - w, 0)
         end = min(self.window_index + w, self.N_ref)
         return start, end
+
+    def step(self, input_features: NDArray[np.float32]) -> None:
+        min_costs = np.inf
+        min_index = max(self.window_index - self.step_size, 0)
+
+        window_start, window_end = self.get_window()
+        window_cost = self.vdist(
+            self.reference_features[window_start:window_end],
+            input_features.squeeze(),
+            self.distance_func,
+        )
+
+        self.global_cost_matrix, min_index, min_costs = oltw_arzt_loop(
+            global_cost_matrix=self.global_cost_matrix,
+            window_cost=window_cost,
+            window_start=window_start,
+            window_end=window_end,
+            input_index=self.input_index,
+            min_costs=min_costs,
+            min_index=min_index,
+        )
+
+        if self.input_index > 0:
+            self._current_frame = int(
+                np.clip(
+                    min_index,
+                    self._current_frame,
+                    self._current_frame + self.step_size,
+                )
+            )
+        else:
+            self._current_frame = min_index
+        self.current_index = self._frame_to_score_idx(self._current_frame)
+        self.input_index += 1
+
+
+class OnlineTimeWarpingArztTempoFrame(OnlineTimeWarpingArztFrame):
+    """Frame-level OLTW with Arzt & Widmer (2010) Simple Tempo Model.
+
+    Dynamically tracks relative tempo via rectified backward path
+    and stretches/compresses reference score features on the fly.
+    """
+
+    def __init__(
+        self,
+        reference_features: NDArray[np.float32],
+        score_positions: NDArray[np.float32],
+        window_size: int = WINDOW_SIZE,
+        step_size: int = STEP_SIZE,
+        distance_func: Union[
+            str, Callable, Tuple[str, Dict[str, Any]]
+        ] = OnlineTimeWarpingArztFrame.DEFAULT_DISTANCE_FUNC,
+        start_window_size: Union[float, int] = START_WINDOW_SIZE,
+        frame_rate: int = FRAME_RATE,
+        ref_frame_to_beat: NDArray = None,
+        queue: Optional[RECVQueue] = None,
+        tempo_window_size: float = 3.0,
+        tempo_min_past: float = 1.0,
+        tempo_n_onsets: int = 20,
+        random_seed: Optional[int] = 1984,
+        use_tempo_model: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            reference_features=reference_features,
+            score_positions=score_positions,
+            window_size=window_size,
+            step_size=step_size,
+            distance_func=distance_func,
+            start_window_size=start_window_size,
+            frame_rate=frame_rate,
+            ref_frame_to_beat=ref_frame_to_beat,
+            queue=queue,
+            **kwargs,
+        )
+        self.use_tempo_model = use_tempo_model
+        self.tempo_window_size = tempo_window_size
+        self.tempo_min_past = tempo_min_past
+        self.tempo_n_onsets = tempo_n_onsets
+        self.random_seed = random_seed
+        self._original_reference_features = reference_features.copy()
+        self._original_ref_frame_to_beat = ref_frame_to_beat.copy()
+        self.reset()
+
+    def reset(self) -> None:
+        super().reset()
+        self.current_relative_tempo: float = 1.0
+        self._consecutive_alterations: int = 0
+        self._backpointers: list = []
+        seed = getattr(self, "random_seed", 1984)
+        self._rng = np.random.RandomState(seed)
+        if (
+            hasattr(self, "_original_reference_features")
+            and self._original_reference_features is not None
+        ):
+            self.reference_features = self._original_reference_features.copy()
+            self._ref_frame_to_beat = self._original_ref_frame_to_beat.copy()
+            self.N_ref = self.reference_features.shape[0]
+            self.global_cost_matrix = np.full(
+                (self.N_ref + 1, 2), np.inf, dtype=np.float32
+            )
+        self._init_onset_mask()
+
+    def _init_onset_mask(self) -> None:
+        if not hasattr(self, "N_ref"):
+            return
+        self.is_onset_frame = np.zeros(self.N_ref, dtype=bool)
+        if (
+            hasattr(self, "score_positions")
+            and self.score_positions is not None
+            and len(self.score_positions) > 0
+            and hasattr(self, "_ref_frame_to_beat")
+            and self._ref_frame_to_beat is not None
+        ):
+            onset_frames = np.searchsorted(
+                self._ref_frame_to_beat, self.score_positions
+            )
+            valid = onset_frames < self.N_ref
+            self.is_onset_frame[onset_frames[valid]] = True
 
     def _get_backward_path(self, max_history_frames: int = 500) -> list:
         """Trace backward path from current position using recorded backpointers."""
@@ -514,52 +587,6 @@ class OnlineTimeWarpingArztFrame(OnlineTimeWarpingArzt):
             self._current_frame = min_index
         self.current_index = self._frame_to_score_idx(self._current_frame)
         self.input_index += 1
-
-
-class OnlineTimeWarpingArztTempoFrame(OnlineTimeWarpingArztFrame):
-    """Frame-level OLTW with Arzt & Widmer (2010) Simple Tempo Model.
-
-    Dynamically tracks relative tempo via rectified backward path
-    and stretches/compresses reference score features on the fly.
-    """
-
-    def __init__(
-        self,
-        reference_features: NDArray[np.float32],
-        score_positions: NDArray[np.float32],
-        window_size: int = WINDOW_SIZE,
-        step_size: int = STEP_SIZE,
-        distance_func: Union[
-            str, Callable, Tuple[str, Dict[str, Any]]
-        ] = OnlineTimeWarpingArztFrame.DEFAULT_DISTANCE_FUNC,
-        start_window_size: Union[float, int] = START_WINDOW_SIZE,
-        frame_rate: int = FRAME_RATE,
-        ref_frame_to_beat: NDArray = None,
-        queue: Optional[RECVQueue] = None,
-        tempo_window_size: float = 3.0,
-        tempo_min_past: float = 1.0,
-        tempo_n_onsets: int = 20,
-        random_seed: Optional[int] = 1984,
-        use_tempo_model: bool = True,
-        **kwargs,
-    ) -> None:
-        super().__init__(
-            reference_features=reference_features,
-            score_positions=score_positions,
-            window_size=window_size,
-            step_size=step_size,
-            distance_func=distance_func,
-            start_window_size=start_window_size,
-            frame_rate=frame_rate,
-            ref_frame_to_beat=ref_frame_to_beat,
-            queue=queue,
-            use_tempo_model=use_tempo_model,
-            tempo_window_size=tempo_window_size,
-            tempo_min_past=tempo_min_past,
-            tempo_n_onsets=tempo_n_onsets,
-            random_seed=random_seed,
-            **kwargs,
-        )
 
 
 # ---------------------------------------------------------------------------
