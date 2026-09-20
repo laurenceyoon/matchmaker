@@ -11,6 +11,7 @@ import numba
 import numpy as np
 import partitura as pt
 from numpy.typing import NDArray
+from scipy.linalg import expm
 
 import time
 
@@ -278,8 +279,6 @@ class PositionTempoKalman:
 
 
 class ScoreInformedIMM:
-    """Interacting Multiple Model (IMM) estimator with score-informed pause transitions."""
-
     def __init__(
         self,
         score_part: Any = None,
@@ -289,71 +288,96 @@ class ScoreInformedIMM:
         obs_var: float = DEFAULT_OBS_VAR,
         tempo: float = 120.0,
         frame_rate: int = FRAME_RATE,
+        single_model: bool = False,
     ):
-        self.H = np.array([1.0, 0.0, 0.0])
+        if obs_var <= 0 or tempo <= 0 or frame_rate <= 0:
+            raise ValueError("Observation variance, tempo and frame rate must be positive")
+        self.single_model = single_model
         self.R = float(obs_var)
+        self.H = np.array([1.0, 0.0, 0.0, 1.0])
         self.score_part = score_part
         self.r2b = ref_frame_to_beat
         self.tempo_bpm = float(tempo)
-        self.frame_rate = int(frame_rate)
-
-        # Extract score pause ranges (fermatas and global rests across all voices)
-        fermatas = (
-            list(score_part.iter_all(pt.score.Fermata)) if score_part is not None else []
-        )
-        fermata_ranges = []
-        for f in fermatas:
-            try:
-                fermata_ranges.append(
-                    (float(score_part.beat_map(f.ref.start.t)), float(score_part.beat_map(f.ref.end.t)))
-                )
-            except Exception:
-                pass
-
-        global_rests = []
+        self.frame_rate = float(frame_rate)
+        self.dt = 1.0 / self.frame_rate
+        self.beat_seconds = 60.0 / self.tempo_bpm
+        if self.r2b is not None and len(self.r2b) > 1:
+            increments = np.diff(self.r2b)
+            positive = increments[increments > 0]
+            if len(positive):
+                self.beat_seconds = self.dt / float(np.median(positive))
+        self.pause_ranges = self._score_pause_ranges(score_part)
+        measure_beats = []
         if score_part is not None:
-            try:
-                na = score_part.note_array()
-                events = []
-                for n in na:
-                    events.append((float(n["onset_beat"]), 1))
-                    events.append((float(n["onset_beat"] + n["duration_beat"]), -1))
-                events.sort(key=lambda x: (x[0], -x[1]))
-                active = 0
-                last_t = 0.0
-                for t, delta in events:
-                    if active == 0 and t > last_t and (t - last_t >= 0.5):
-                        global_rests.append((last_t, t))
-                    active += delta
-                    last_t = t
-            except Exception:
-                pass
-        self.pause_ranges = list(set(fermata_ranges + global_rests))
+            for measure in score_part.iter_all(pt.score.Measure):
+                if measure.start is not None and measure.end is not None:
+                    duration = float(score_part.beat_map(measure.end.t) - score_part.beat_map(measure.start.t))
+                    if duration > 0:
+                        measure_beats.append(duration)
+        self.measure_seconds = self.beat_seconds * (float(np.median(measure_beats)) if measure_beats else 1.0)
 
-        # Kinematic regimes: 0: CV (steady), 1: CA (varying tempo), 2: ZV (pause/rest)
-        dt = 1.0
-        self.F = [
-            np.array([[1.0, dt, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]]),
-            np.array([[1.0, dt, 0.5 * dt**2], [0.0, 1.0, dt], [0.0, 0.0, 1.0]]),
-            np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
-        ]
-        q_cv, q_ca = 0.01, 0.05
-        self.Q = [
-            np.diag([q_cv * 0.25, q_cv, 1e-6]),
-            np.array([
-                [q_ca * (dt**4) / 4, q_ca * (dt**3) / 2, q_ca * (dt**2) / 2],
-                [q_ca * (dt**3) / 2, q_ca * (dt**2), q_ca * dt],
-                [q_ca * (dt**2) / 2, q_ca * dt, q_ca],
-            ]) + np.diag([1e-4, 1e-4, 1e-4]),
-            np.diag([1e-6, 1e-6, 1e-6]),
-        ]
-        self.M_play = np.array([[0.95, 0.05, 0.00],
-                                [0.20, 0.80, 0.00],
-                                [0.50, 0.50, 0.00]])
-        self.M_pause = np.array([[0.10, 0.05, 0.85],
-                                 [0.05, 0.10, 0.85],
-                                 [0.02, 0.01, 0.97]])
-        self.reset(position=init_position, tempo=init_tempo)
+        dt = self.dt
+        self.F = np.array([
+            [[1, dt, 0], [0, 1, 0], [0, 0, 0]],
+            [[1, dt, dt**2 / 2], [0, 1, dt], [0, 0, 1]],
+            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+        ], dtype=float)
+
+        q_ca = 20 * self.R / self.beat_seconds**5
+        self.Q = np.array([
+            np.zeros((3, 3)),
+            q_ca * np.array([[dt**5 / 20, dt**4 / 8, dt**3 / 6],
+                             [dt**4 / 8, dt**3 / 3, dt**2 / 2],
+                             [dt**3 / 6, dt**2 / 2, dt]]),
+            np.zeros((3, 3)),
+        ])
+        self.F = np.pad(self.F, ((0, 0), (0, 1), (0, 1)))
+        self.Q = np.pad(self.Q, ((0, 0), (0, 1), (0, 1)))
+        self.M_play = self._transition_matrix(allow_pause=False)
+        self.M_pause = self._transition_matrix(allow_pause=True)
+        self.reset(init_position, init_tempo)
+
+    @staticmethod
+    def _score_pause_ranges(score_part: Any) -> list:
+        if score_part is None:
+            return []
+        ranges = []
+        for fermata in score_part.iter_all(pt.score.Fermata):
+            ref = fermata.ref
+            if getattr(ref, "start", None) is not None and getattr(ref, "end", None) is not None:
+                ranges.append((float(score_part.beat_map(ref.start.t)),
+                               float(score_part.beat_map(ref.end.t))))
+
+        notes = score_part.note_array()
+        if len(notes):
+            intervals = sorted((float(n["onset_beat"]),
+                                float(n["onset_beat"] + n["duration_beat"]))
+                               for n in notes)
+            end = intervals[0][1]
+            for start, stop in intervals[1:]:
+                if start > end:
+                    ranges.append((end, start))
+                end = max(end, stop)
+        return sorted(set(ranges))
+
+    def _transition_matrix(self, allow_pause: bool) -> np.ndarray:
+        if self.single_model:
+            return np.tile([1.0, 0.0, 0.0], (3, 1))
+        n = 3 if allow_pause else 2
+        durations = np.array([self.measure_seconds, self.beat_seconds, self.beat_seconds])[:n]
+        generator = np.ones((n, n)) / (durations[:, None] * (n - 1))
+        np.fill_diagonal(generator, -1 / durations)
+        matrix = np.zeros((3, 3))
+        matrix[:n, :n] = expm(generator * self.dt)
+        if not allow_pause:
+            matrix[2, :2] = 1 / 2
+        return matrix
+
+    def _combine(self, probabilities: np.ndarray) -> None:
+        self.state = probabilities @ self.states
+        residuals = self.states - self.state
+        self.P = np.einsum("i,ijk->jk", probabilities, self.P_matrices)
+        self.P += np.einsum("i,ij,ik->jk", probabilities, residuals, residuals)
 
     @property
     def position(self) -> float:
@@ -361,101 +385,100 @@ class ScoreInformedIMM:
 
     @property
     def tempo(self) -> float:
-        return float(self.state[1])
+        """Reference frames per input frame, matching the SoftOLTW interface."""
+        return float(self.state[1] * self.dt)
 
     @property
     def position_uncertainty(self) -> float:
-        return float(np.sqrt(max(self.P[0, 0], 1e-6)))
+        return float(np.sqrt(max(self.P[0, 0], 0.0)))
 
     @property
     def mode_probabilities(self) -> Tuple[float, float, float]:
-        return (float(self.mu[0]), float(self.mu[1]), float(self.mu[2]))
+        return tuple(float(p) for p in self.mu)
 
     def reset(self, position: float = 0.0, tempo: float = 1.0) -> None:
-        self.mu = np.array([0.7, 0.2, 0.1])
-        self.mu_history: list = [tuple(float(x) for x in self.mu)]
+        velocity = tempo / self.dt
+
+        self.mu = np.array([1.0, 0.0, 0.0])
         self.c_bar = self.mu.copy()
-        self.states = np.array([
-            [position, tempo, 0.0],
-            [position, tempo, 0.0],
-            [position, 0.0, 0.0],
-        ])
+        self.states = np.array([[position, velocity, 0.0],
+                                [position, velocity, 0.0], [position, 0.0, 0.0]])
+
         self.P_matrices = np.array([
-            np.diag([10.0, 1.0, 0.01]),
-            np.diag([10.0, 3.0, 1.0]),
-            np.diag([10.0, 0.01, 0.01]),
+            np.diag([self.R, velocity**2, 0]),
+            np.diag([self.R, velocity**2, (velocity / self.beat_seconds)**2]),
+            np.diag([self.R, 0, 0]),
         ])
-        self.state = np.array([position, tempo, 0.0])
-        self.P = np.diag([10.0, 1.0, 0.01])
+        self.states = np.pad(self.states, ((0, 0), (0, 1)))
+        self.P_matrices = np.pad(self.P_matrices, ((0, 0), (0, 1), (0, 1)))
+        self.mu_history = [self.mode_probabilities]
+        self._combine(self.mu)
+
+    def set_observation_error(self, variance: float, initialize: bool = False) -> None:
+        duration_frames = np.sqrt(12 * variance)
+        correlation = np.exp(-1 / duration_frames) if duration_frames > 0 else 0.0
+        self.F[:, 3, 3] = correlation
+        self.Q[:, 3, 3] = variance * (1 - correlation**2)
+        if initialize:
+            self.P_matrices[:, 3, 3] = variance
 
     def predict(self, is_silent: Optional[bool] = None) -> np.ndarray:
-        if self.r2b is not None and len(self.r2b) > 0:
-            idx = int(np.clip(round(self.position), 0, len(self.r2b) - 1))
-            curr_beat = float(self.r2b[idx])
-        else:
-            curr_beat = float(self.position)
+        beat = self.position
+        if self.r2b is not None and len(self.r2b):
+            beat = float(np.interp(self.position, np.arange(len(self.r2b)), self.r2b))
+        allow_pause = any(start <= beat < end for start, end in self.pause_ranges)
 
-        is_pause = (is_silent is True) or any(
-            s <= curr_beat <= e for s, e in self.pause_ranges
+        if self.score_part is None and is_silent is True:
+            allow_pause = True
+        transition = self.M_pause if allow_pause else self.M_play
+
+        self.c_bar = self.mu @ transition
+        mixing = np.divide(
+            self.mu[:, None] * transition, self.c_bar[None, :],
+            out=np.zeros_like(transition), where=self.c_bar[None, :] > 0,
         )
-        M = self.M_pause if is_pause else self.M_play
+        for j in np.flatnonzero(self.c_bar == 0):
+            mixing[j, j] = 1.0
+        mixed_states = mixing.T @ self.states
+        residuals = self.states[:, None, :] - mixed_states[None, :, :]
+        mixed_covariances = np.einsum("ij,ikl->jkl", mixing, self.P_matrices)
+        mixed_covariances += np.einsum("ij,ijk,ijl->jkl", mixing, residuals, residuals)
 
-        c_bar = self.mu @ M
-        self.c_bar = np.maximum(c_bar, 1e-12)
-        omega = (M * self.mu[:, None]) / self.c_bar[None, :]
-
-        x_mixed = omega.T @ self.states
-        P_mixed = np.zeros((3, 3, 3))
-        for j in range(3):
-            for i in range(3):
-                y = self.states[i] - x_mixed[j]
-                P_mixed[j] += omega[i, j] * (self.P_matrices[i] + np.outer(y, y))
-
-        for j in range(3):
-            self.states[j] = self.F[j] @ x_mixed[j]
-            self.P_matrices[j] = self.F[j] @ P_mixed[j] @ self.F[j].T + self.Q[j]
-
-        self.states[0, 1] = max(0.2, self.states[0, 1])
-        self.states[2, 1] = 0.0
-        self.states[2, 2] = 0.0
-
-        self.state = self.c_bar @ self.states
-        self.P = np.zeros((3, 3))
-        for j in range(3):
-            dx = self.states[j] - self.state
-            self.P += self.c_bar[j] * (self.P_matrices[j] + np.outer(dx, dx))
+        self.states = np.einsum("ijk,ik->ij", self.F, mixed_states)
+        self.P_matrices = self.F @ mixed_covariances @ self.F.transpose(0, 2, 1) + self.Q
+        self._combine(self.c_bar)
         return self.state.copy()
 
-    def update(self, z: float) -> np.ndarray:
-        z_val = float(z)
-        lik = np.zeros(3)
-        for j in range(3):
-            y = z_val - np.dot(self.H, self.states[j])
-            S = np.dot(self.H, self.P_matrices[j] @ self.H) + self.R
-            K = (self.P_matrices[j] @ self.H) / S
-            self.states[j] += K * y
-            self.P_matrices[j] -= np.outer(K, self.H) @ self.P_matrices[j]
-            lik[j] = (1.0 / np.sqrt(2.0 * np.pi * S)) * np.exp(-0.5 * (y**2) / S)
+    def update(self, z: Optional[float], obs_var: Optional[float] = None) -> np.ndarray:
+        if z is None:
+            self.mu = self.c_bar.copy()
+            self.mu_history.append(self.mode_probabilities)
+            return self.state.copy()
+        observation_variance = self.R if obs_var is None else float(obs_var)
+        innovations = float(z) - self.states @ self.H
+        cross_covariances = self.P_matrices @ self.H
+        variances = cross_covariances @ self.H + observation_variance
+        gains = cross_covariances / variances[:, None]
+        self.states += gains * innovations[:, None]
+        residual = np.eye(len(self.H))[None, :, :] - gains[:, :, None] * self.H
+        self.P_matrices = (
+            residual @ self.P_matrices @ residual.transpose(0, 2, 1)
+            + observation_variance * gains[:, :, None] * gains[:, None, :]
+        )
+        log_weights = np.full(3, -np.inf)
+        active = self.c_bar > 0
+        log_weights[active] = np.log(self.c_bar[active]) - 0.5 * (
+            np.log(2 * np.pi * variances[active])
+            + innovations[active]**2 / variances[active]
+        )
+        weights = np.exp(log_weights - np.max(log_weights))
+        self.mu = weights / weights.sum()
 
-        unnorm_mu = self.c_bar * np.maximum(lik, 1e-12)
-        self.mu = unnorm_mu / np.sum(unnorm_mu)
-
-        self.states[0, 1] = max(0.2, self.states[0, 1])
-        self.states[2, 1] = 0.0
-        self.states[2, 2] = 0.0
-
-        self.state = self.mu @ self.states
-        self.P = np.zeros((3, 3))
-        for j in range(3):
-            dx = self.states[j] - self.state
-            self.P += self.mu[j] * (self.P_matrices[j] + np.outer(dx, dx))
-        self.mu_history.append(tuple(float(x) for x in self.mu))
+        self._combine(self.mu)
+        self.mu_history.append(self.mode_probabilities)
         return self.state.copy()
-
 
 class SoftOnlineTimeWarping(OnlineAlignment):
-    """Soft-min Online Time Warping with directional weighting and score-informed IMM."""
-
     DEFAULT_DISTANCE_FUNC: str = "Manhattan"
 
     def __init__(
@@ -470,6 +493,8 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         prior_sigma: float = 50.0,
         obs_var: float = DEFAULT_OBS_VAR,
         use_imm: bool = True,
+        tempo_model: str = "imm",
+        score_observation: str = "variance",
         score_part: Any = None,
         distance_func: Union[str, Callable, Tuple[str, Dict[str, Any]]] = DEFAULT_DISTANCE_FUNC,
         start_window_size: Union[float, int] = 0.1,
@@ -525,6 +550,11 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         self._obs_var = obs_var
         self.expected_advance_rate = 1.0
         self.use_imm = use_imm
+        if tempo_model not in ("imm", "cv"):
+            raise ValueError("tempo_model must be imm or cv")
+        if score_observation not in ("fixed", "variance"):
+            raise ValueError("score_observation must be fixed or variance")
+        self.score_observation = score_observation
         self.score_part = score_part
 
         self.max_score_step = max(1, int(max_score_step))
@@ -538,19 +568,52 @@ class SoftOnlineTimeWarping(OnlineAlignment):
             self.repeat_boundaries = self._extract_repeat_boundaries()
 
         self._init_gamma_array()
+        self._init_score_uncertainty()
 
-        if self.use_imm and self.score_part is not None:
+        if self.use_imm:
             self.kalman = ScoreInformedIMM(
                 score_part=self.score_part,
                 ref_frame_to_beat=self._ref_frame_to_beat,
                 obs_var=self._obs_var,
                 tempo=self.tempo,
                 frame_rate=self.frame_rate,
+                single_model=tempo_model == "cv",
             )
         else:
             self.kalman = PositionTempoKalman(obs_var=self._obs_var)
 
         self.reset()
+
+    def _init_score_uncertainty(self) -> None:
+        frames = np.arange(self.N_ref, dtype=float)
+        self._score_position_variance = np.zeros(self.N_ref)
+        if self.score_part is None or self._ref_frame_to_beat is None:
+            return
+        events = {}
+        for note in self.score_part.note_array():
+            start, duration = float(note["onset_beat"]), float(note["duration_beat"])
+            if duration <= 0:
+                continue
+            pc = int(note["pitch"]) % 12
+            for beat, delta in ((start, 1), (start + duration, -1)):
+                events.setdefault(beat, []).append((pc, delta))
+        counts = np.zeros(12, dtype=int)
+        signature, run_start, spans = None, None, []
+        for beat, changes in sorted(events.items()):
+            for pc, delta in changes:
+                counts[pc] += delta
+            updated = tuple(np.flatnonzero(counts > 0))
+            if updated != signature:
+                if run_start is not None:
+                    spans.append((run_start, beat))
+                run_start, signature = beat, updated
+        beats = self._ref_frame_to_beat
+        if run_start is not None and run_start < beats[-1]:
+            spans.append((run_start, float(beats[-1])))
+        for start, end in spans:
+            left, right = np.searchsorted(beats, [start, end])
+            start_frame, end_frame = np.interp([start, end], beats, frames)
+            self._score_position_variance[left:right] = (end_frame - start_frame)**2 / 12
 
     def _extract_repeat_boundaries(self) -> list:
         rep_beats: list = []
@@ -661,10 +724,8 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         return max(0, min(idx, len(self.score_positions) - 1))
 
     def get_current_position(self) -> float:
-        if isinstance(self.kalman, ScoreInformedIMM) and self.input_index > 5:
-            if self.kalman.mu[2] > 0.5:
-                return self._frame_to_beat(float(self.kalman.position))
-            return self._frame_to_beat(self._current_frame)
+        if isinstance(self.kalman, ScoreInformedIMM):
+            return self._frame_to_beat(self.kalman.position)
         return self._frame_to_beat(self._current_frame)
 
     def get_window(self) -> Tuple[int, int]:
@@ -695,14 +756,19 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         # Lead-in silence gating: wait for first audio onset before advancing
         feat_abs = np.abs(feat)
         peakiness = float(np.max(feat_abs)) / (float(np.mean(feat_abs)) + 1e-10)
+        is_silent = peakiness < 2.0
         if not self._music_started:
-            if peakiness < 2.0:
+            if is_silent:
                 self._pos_history.append(self._current_frame)
                 return
             self._music_started = True
 
-        # IMM / Kalman prediction
-        self.kalman.predict()
+        if isinstance(self.kalman, ScoreInformedIMM):
+            frame = int(np.clip(round(self.kalman.position), 0, self.N_ref - 1))
+            variance = self._score_position_variance[frame] if self.score_observation == "variance" else 0.0
+            self.kalman.set_observation_error(variance, initialize=self.input_index == 0)
+        if self.input_index > 0:
+            self.kalman.predict()
 
         # Window local distances
         min_costs = np.inf
@@ -714,22 +780,19 @@ class SoftOnlineTimeWarping(OnlineAlignment):
             self.distance_func,
         )
 
-        # Directional weighting: penalize horizontal stalling when tracker is active
-        expected_tempo = 1.0
+        is_imm = isinstance(self.kalman, ScoreInformedIMM)
+        expected_tempo = float(self.kalman.tempo) if is_imm else 1.0
         recent_tempo = 1.0
         if len(self._pos_history) >= self._min_history_frames:
             lookback = min(self._lookback_frames, len(self._pos_history))
             recent_tempo = (
                 self._current_frame - self._pos_history[-lookback]
             ) / lookback
-
-        racing_scale = self.velocity_scale * max(expected_tempo, 0.1)
-        racing_amount = np.clip(
-            (recent_tempo - expected_tempo) / racing_scale, 0.0, 1.0
+        excess_tempo = (recent_tempo - 1.0) / self.velocity_scale
+        effective_wh = 1.0 + (self.w_horizontal - 1.0) * np.clip(
+            excess_tempo, 0.0, 1.0
         )
-        effective_wh = 1.0 + (self.w_horizontal - 1.0) * racing_amount
-        wv = 1.0
-        wd = 1.0
+        wv = wd = 1.0
         wh = effective_wh
 
         # Weighted Soft-OLTW DP loop
@@ -784,6 +847,7 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         self._pos_history.append(self._current_frame)
 
         # IMM observation update
+
         self.kalman.update(float(self._current_frame))
 
         mu_val = (
@@ -809,8 +873,8 @@ class SoftOnlineTimeWarping(OnlineAlignment):
             median_local_cost=None,
             local_cost_margin=None,
             informativeness=1.0,
-            effective_horizontal_weight=float(wh),
-            expected_advance_rate=float(self.kalman.tempo),
+            effective_horizontal_weight=float(effective_wh),
+            expected_advance_rate=float(expected_tempo),
             is_informative=True,
             mode_probabilities=mu_val,
         )

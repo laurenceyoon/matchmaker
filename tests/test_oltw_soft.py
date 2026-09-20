@@ -55,16 +55,17 @@ class TestSoftOnlineTimeWarping(unittest.TestCase):
         imm = ScoreInformedIMM(score_part=None, ref_frame_to_beat=None)
         imm.pause_ranges = [(4.0, 4.5)]
 
-        # Pause region -> shifts to zero-velocity transition probability
+        # Pause regions permit ZV without forcing the score clock to stop.
         imm.reset(position=4.2, tempo=1.0)
         imm.predict()
-        self.assertGreater(imm.M_pause[0, 2], 0.8)
+        self.assertGreater(imm.M_pause[0, 2], 0.0)
+        self.assertGreater(imm.M_pause[0, 0], imm.M_pause[0, 2])
 
         # IMM predict and update
         pred = imm.predict()
-        self.assertEqual(pred.shape, (3,))
+        self.assertEqual(pred.shape, (4,))
         updated = imm.update(4.2)
-        self.assertEqual(updated.shape, (3,))
+        self.assertEqual(updated.shape, (4,))
         self.assertAlmostEqual(np.sum(imm.mu), 1.0, places=5)
 
     def test_matchmaker_audio_integration(self):
@@ -114,8 +115,55 @@ class TestSoftOnlineTimeWarping(unittest.TestCase):
         for _ in range(20):
             imm.predict(is_silent=True)
             imm.update(p)
-        self.assertGreater(imm.mu[2], 0.75, "ZV should dominate during pause")
+        self.assertEqual(int(np.argmax(imm.mu)), 2, "ZV should be the most likely pause model")
 
+
+    def test_imm_large_innovation_preserves_likelihood_ranking(self):
+        """A far-away observation must not collapse all likelihoods to a floor."""
+        imm = ScoreInformedIMM(obs_var=1.0)
+        imm.predict(is_silent=False)
+        imm.states[0, 0] = 0.0
+        imm.states[1, 0] = 20.0
+        imm.P_matrices[:] = np.eye(len(imm.H))
+        imm.update(100.0)
+        self.assertGreater(imm.mu[1], 0.99)
+        self.assertEqual(imm.mu[2], 0.0)
+        for covariance in imm.P_matrices:
+            np.testing.assert_allclose(covariance, covariance.T, atol=1e-12)
+            self.assertGreaterEqual(np.linalg.eigvalsh(covariance).min(), 0.0)
+
+    def test_imm_pause_resume_far_from_origin(self):
+        """An inactive pause mode must not pull a late pause toward frame zero."""
+        imm = ScoreInformedIMM(init_position=1000.0)
+        for p in range(1001, 1031):
+            imm.predict(is_silent=False)
+            imm.update(float(p))
+        for _ in range(20):
+            imm.predict(is_silent=True)
+            imm.update(1030.0)
+        self.assertLess(abs(imm.position - 1030.0), 1.0)
+        self.assertEqual(int(np.argmax(imm.mu)), 2)
+        for p in range(1031, 1051):
+            imm.predict(is_silent=False)
+            imm.update(float(p))
+        self.assertLess(abs(imm.position - 1050.0), 1.0)
+        self.assertEqual(imm.mu[2], 0.0)
+
+    def test_filter_ablation_preserves_acoustic_path(self):
+        """Turning feedback off isolates filtering from acoustic alignment."""
+        reference = np.eye(12, dtype=np.float32)[np.arange(48) % 12]
+        common = dict(reference_features=reference, frame_rate=10,
+                      window_size=2, start_window_size=0.3)
+        baseline = SoftOnlineTimeWarping(**common, use_imm=False)
+        filtered = SoftOnlineTimeWarping(**common)
+        positions = []
+        for feature in np.repeat(reference, 2, axis=0):
+            baseline.step(feature)
+            filtered.step(feature)
+            self.assertEqual(filtered._current_frame, baseline._current_frame)
+            positions.append(filtered.get_current_position())
+        self.assertTrue(np.isfinite(positions).all())
+        self.assertTrue(any(abs(p - round(p)) > 1e-6 for p in positions))
 
     def test_continuous_subframe_interpolation(self):
         """Verify that continuous float frames interpolate smoothly between discrete beat points."""
