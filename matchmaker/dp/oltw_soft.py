@@ -33,6 +33,9 @@ from matchmaker.utils.misc import set_latency_stats
 DEFAULT_GAMMA: float = 0.05
 DEFAULT_W_HORIZONTAL: float = 10.0
 DEFAULT_OBS_VAR: float = 5.0
+DEFAULT_TEMPO_LOOKBACK_SEC: float = 1.0
+DEFAULT_VELOCITY_SCALE: float = 0.35
+DEFAULT_MIN_HISTORY_SEC: float = 0.33
 
 
 @dataclass(frozen=True)
@@ -479,6 +482,9 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         gamma_repeat_factor: float = 1.0,
         gamma_repeat_window_beats: float = 1.5,
         tempo: float = 120.0,
+        tempo_lookback_sec: float = DEFAULT_TEMPO_LOOKBACK_SEC,
+        velocity_scale: float = DEFAULT_VELOCITY_SCALE,
+        min_history_sec: float = DEFAULT_MIN_HISTORY_SEC,
         **kwargs,
     ) -> None:
         if ref_frame_to_beat is None and score_positions is not None:
@@ -494,6 +500,11 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         self.N_ref: int = self.reference_features.shape[0]
         self.frame_rate = frame_rate
         self.tempo = float(tempo)
+        self.tempo_lookback_sec = float(tempo_lookback_sec)
+        self.velocity_scale = float(velocity_scale)
+        self.min_history_sec = float(min_history_sec)
+        self._lookback_frames = max(1, int(np.round(self.tempo_lookback_sec * self.frame_rate)))
+        self._min_history_frames = max(2, int(np.round(self.min_history_sec * self.frame_rate)))
         self._ref_frame_to_beat = ref_frame_to_beat
         self.step_size = step_size
         self._window_size = int(np.round(window_size * self.frame_rate))
@@ -706,13 +717,13 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         # Directional weighting: penalize horizontal stalling when tracker is active
         expected_tempo = 1.0
         recent_tempo = 1.0
-        if len(self._pos_history) >= 10:
-            lookback = min(30, len(self._pos_history))
+        if len(self._pos_history) >= self._min_history_frames:
+            lookback = min(self._lookback_frames, len(self._pos_history))
             recent_tempo = (
                 self._current_frame - self._pos_history[-lookback]
             ) / lookback
 
-        racing_scale = 0.35 * max(expected_tempo, 0.1)
+        racing_scale = self.velocity_scale * max(expected_tempo, 0.1)
         racing_amount = np.clip(
             (recent_tempo - expected_tempo) / racing_scale, 0.0, 1.0
         )
