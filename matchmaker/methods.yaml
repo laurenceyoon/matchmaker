@@ -236,6 +236,7 @@ methods:
         window_size: 10
         step_size: 3
         use_imm: true
+        path_tempo: true
 
     softoltw_no_imm:
       class: matchmaker.dp:SoftOnlineTimeWarping
