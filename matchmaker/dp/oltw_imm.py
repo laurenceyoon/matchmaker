@@ -145,8 +145,10 @@ class IMMOnlineTimeWarping(SoftOnlineTimeWarping):
         correlated_observation=True,
         **kwargs,
     ):
-        kwargs.update(use_imm=False, path_tempo=False, filter_output=False)
-        super().__init__(*args, **kwargs)
+        self.path_filter = None
+        super().__init__(
+            *args, use_imm=False, path_tempo=False, filter_output=False, **kwargs
+        )
         model = ScoreInformedIMM(
             score_part=self.score_part,
             ref_frame_to_beat=self._ref_frame_to_beat,
@@ -166,7 +168,7 @@ class IMMOnlineTimeWarping(SoftOnlineTimeWarping):
 
     def reset(self):
         super().reset()
-        if hasattr(self, "path_filter"):
+        if self.path_filter is not None:
             self.path_filter.reset()
             self.path_lattice = self.path_filter
             self.global_cost_matrix = None

@@ -1,6 +1,7 @@
 import numpy as np
+import pytest
 from matchmaker.prob.imm import ScoreInformedIMM
-from matchmaker.dp.oltw_imm import IMMPathFilter
+from matchmaker.dp.oltw_imm import IMMOnlineTimeWarping, IMMPathFilter
 
 
 def test_one_path_reduces_to_standard_imm():
@@ -141,3 +142,33 @@ def test_reference_frame_coordinates_do_not_require_a_beat_map():
     assert position == 1
     assert np.isfinite(cost)
     assert np.isfinite(path.position)
+
+
+def test_alignment_reset_reproduces_the_same_path_and_state():
+    features = np.eye(12, dtype=np.float32)[np.arange(90) // 6 % 12]
+    follower = IMMOnlineTimeWarping(features, ref_frame_to_beat=np.arange(90) / 15)
+    outputs = []
+    for _ in range(2):
+        assert follower.path_lattice is follower.path_filter
+        positions = []
+        for frame in features[:30]:
+            follower.step(frame)
+            positions.append(follower.get_current_position())
+        outputs.append(
+            (
+                np.array(positions),
+                follower.path_filter.states.copy(),
+                follower.path_filter.covariances.copy(),
+            )
+        )
+        follower.reset()
+        assert follower.input_index == 0
+        assert follower.path_filter.position == 0
+    for first, second in zip(*outputs):
+        np.testing.assert_array_equal(first, second)
+
+
+@pytest.mark.parametrize("option", ["use_imm", "path_tempo", "filter_output"])
+def test_legacy_filter_switches_are_not_silently_overridden(option):
+    with pytest.raises(TypeError, match=option):
+        IMMOnlineTimeWarping(np.eye(12, dtype=np.float32), **{option: False})
