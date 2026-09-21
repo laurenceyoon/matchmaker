@@ -186,3 +186,13 @@ def test_single_mode_reduces_to_ordinary_kalman_recursion():
             assert imm.mu[index] == 1.
             np.testing.assert_allclose(imm.state, state, atol=1e-10)
             np.testing.assert_allclose(imm.P, covariance, atol=1e-10)
+
+
+def test_ungated_zv_is_available_without_forcing_a_pause():
+    gated = ScoreInformedIMM()
+    ungated = ScoreInformedIMM(score_pause_gating=False)
+    gated.predict()
+    ungated.predict()
+    assert gated.c_bar[2] == 0.
+    assert 0. < ungated.c_bar[2] < ungated.c_bar[0]
+    np.testing.assert_allclose(ungated.c_bar, ungated.M_pause[0])

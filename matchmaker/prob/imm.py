@@ -21,6 +21,7 @@ class ScoreInformedIMM:
         tempo: float = 120.0,
         frame_rate: int = FRAME_RATE,
         modes: Tuple[str, ...] = ("cv", "ca", "zv"),
+        score_pause_gating: bool = True,
     ):
         if obs_var <= 0 or tempo <= 0 or frame_rate <= 0:
             raise ValueError("Observation variance, tempo and frame rate must be positive")
@@ -30,6 +31,7 @@ class ScoreInformedIMM:
         self.R = float(obs_var)
         self.H = np.array([1.0, 0.0, 0.0, 1.0])
         self.score_part = score_part
+        self.score_pause_gating = score_pause_gating
         self.r2b = ref_frame_to_beat
         self.tempo_bpm = float(tempo)
         self.frame_rate = float(frame_rate)
@@ -160,7 +162,7 @@ class ScoreInformedIMM:
         beat = self.position
         if self.r2b is not None and len(self.r2b):
             beat = float(np.interp(self.position, np.arange(len(self.r2b)), self.r2b))
-        allow_pause = any(start <= beat < end for start, end in self.pause_ranges)
+        allow_pause = not self.score_pause_gating or any(start <= beat < end for start, end in self.pause_ranges)
 
         if self.score_part is None and is_silent is True:
             allow_pause = True

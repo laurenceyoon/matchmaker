@@ -107,6 +107,7 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         imm_modes: Tuple[str, ...] = ("cv", "ca", "zv"),
         correlated_observation: bool = True,
         filter_output: bool = True,
+        score_pause_gating: bool = True,
         score_part: Any = None,
         distance_func: Union[str, Callable, Tuple[str, Dict[str, Any]]] = DEFAULT_DISTANCE_FUNC,
         start_window_size: Union[float, int] = 0.1,
@@ -169,6 +170,7 @@ class SoftOnlineTimeWarping(OnlineAlignment):
                 tempo=self.tempo,
                 frame_rate=self.frame_rate,
                 modes=imm_modes,
+                score_pause_gating=score_pause_gating,
             )
         else:
             self.kalman = None
