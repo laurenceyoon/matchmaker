@@ -1,9 +1,12 @@
-from .directed_graph import (
+from .score_graph import (
+    EdgeKind,
+    ScoreEdge,
+    ScoreGraph,
+    ScoreNode,
     ScoreDirectedGraph,
     ScoreDirectedGraphBuilder,
     rebase_measure_beats,
 )
-from .score_graph import EdgeKind, ScoreEdge, ScoreGraph, ScoreNode
 
 MusicXMLFormParser = ScoreDirectedGraphBuilder
 ParsedScoreForm = ScoreDirectedGraph

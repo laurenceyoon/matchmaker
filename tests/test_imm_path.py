@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 from matchmaker.prob.imm import IMMMotionModels
-from matchmaker.dp.oltw_imm import IMMOnlineTimeWarping, IMMPathFilter
+from matchmaker.dp.oltw_imm import IMMPathFilter
+from matchmaker.dp.oltw_soft import SoftOnlineTimeWarping
 
 
 def scalar_imm_step(model, states, covariances, probabilities, observation, variance):
@@ -173,7 +174,7 @@ def test_reference_frame_coordinates_do_not_require_a_beat_map():
 
 def test_alignment_reset_reproduces_the_same_path_and_state():
     features = np.eye(12, dtype=np.float32)[np.arange(90) // 6 % 12]
-    follower = IMMOnlineTimeWarping(features, ref_frame_to_beat=np.arange(90) / 15)
+    follower = SoftOnlineTimeWarping(features, ref_frame_to_beat=np.arange(90) / 15)
     outputs = []
     for _ in range(2):
         positions = []
@@ -197,11 +198,11 @@ def test_alignment_reset_reproduces_the_same_path_and_state():
 @pytest.mark.parametrize("option", ["path_tempo", "filter_output"])
 def test_legacy_filter_switches_are_not_silently_overridden(option):
     with pytest.raises(TypeError, match=option):
-        IMMOnlineTimeWarping(np.eye(12, dtype=np.float32), **{option: False})
+        SoftOnlineTimeWarping(np.eye(12, dtype=np.float32), **{option: False})
 
 
 def test_without_imm_matches_acoustic_baseline_and_constructs_no_models(monkeypatch):
-    import matchmaker.dp.oltw_imm as module
+    import matchmaker.dp.oltw_soft as module
     from matchmaker.dp.oltw_soft import SoftOnlineTimeWarping, SoftWarpingPath
 
     def forbidden(*args, **kwargs):
@@ -210,8 +211,8 @@ def test_without_imm_matches_acoustic_baseline_and_constructs_no_models(monkeypa
     monkeypatch.setattr(module, "IMMMotionModels", forbidden)
     monkeypatch.setattr(module, "score_position_variance", forbidden)
     features = np.eye(12, dtype=np.float32)[np.arange(90) // 6 % 12]
-    baseline = SoftOnlineTimeWarping(features)
-    ablation = IMMOnlineTimeWarping(features, use_imm=False)
+    baseline = SoftOnlineTimeWarping(features, use_imm=False, backend="python")
+    ablation = SoftOnlineTimeWarping(features, use_imm=False)
     assert isinstance(ablation.path, SoftWarpingPath)
     for _ in range(2):
         for frame in features:
@@ -225,10 +226,10 @@ def test_without_imm_matches_acoustic_baseline_and_constructs_no_models(monkeypa
 
 def test_path_restart_preserves_motion_and_reanchors_position():
     features = np.eye(12, dtype=np.float32)[np.arange(90) // 6 % 12]
-    follower = IMMOnlineTimeWarping(features)
+    follower = SoftOnlineTimeWarping(features)
     for frame in features[:30]:
         follower.step(frame)
-    child = IMMOnlineTimeWarping(features)
+    child = SoftOnlineTimeWarping(features)
     child.reset(60)
     child.path.restart_from(follower.path, 60)
     np.testing.assert_array_equal(

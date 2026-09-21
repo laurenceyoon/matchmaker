@@ -11,6 +11,12 @@ DEFAULT_OBS_VAR = 5.0
 
 
 class IMMMotionModels:
+    """Score-informed dynamics and IMM prediction, owned by IMMPathFilter.
+
+    States contain position, velocity, acceleration and correlated observation
+    error. This component neither consumes audio nor emits an alignment path.
+    """
+
     def __init__(
         self,
         score_part: Any = None,
@@ -20,6 +26,7 @@ class IMMMotionModels:
         frame_rate: int = FRAME_RATE,
         modes: Tuple[str, ...] = ("cv", "ca", "zv"),
         score_pause_gating: bool = True,
+        retain_tempo: bool = False,
     ):
         if obs_var <= 0 or tempo <= 0 or frame_rate <= 0:
             raise ValueError(
@@ -62,7 +69,7 @@ class IMMMotionModels:
             [
                 [[1, dt, 0], [0, 1, 0], [0, 0, 0]],
                 [[1, dt, dt**2 / 2], [0, 1, dt], [0, 0, 1]],
-                [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+                [[1, 0, 0], [0, int(retain_tempo), 0], [0, 0, 0]],
             ],
             dtype=float,
         )
@@ -152,12 +159,12 @@ class IMMMotionModels:
         )
         return states, covariances, probabilities
 
-    def predict(self, probabilities, states, covariance, score_variance):
+    def predict(self, probabilities, states, covariance, score_variance, allow_pause=False):
         means = np.einsum("am,amd->ad", probabilities, states)
         beats = means[:, 0]
         if self.r2b is not None:
             beats = np.interp(beats, np.arange(len(self.r2b)), self.r2b)
-        allowed = np.full(len(states), not self.score_pause_gating)
+        allowed = np.full(len(states), allow_pause or not self.score_pause_gating)
         for start, end in self.pause_ranges:
             allowed |= (beats >= start) & (beats < end)
         transition = np.where(allowed[:, None, None], self.M_pause, self.M_play)
@@ -188,6 +195,17 @@ class IMMMotionModels:
         predicted = np.einsum("amij,amj->ami", dynamics, mixed)
         covariance = dynamics @ covariance @ dynamics.swapaxes(-1, -2) + noise
         return priors, predicted, covariance
+
+
+def score_activity(score_part, beats, size):
+    if score_part is None or beats is None:
+        return np.ones(size, dtype=bool)
+    notes = score_part.note_array()
+    starts = np.sort(notes["onset_beat"])
+    ends = np.sort(notes["onset_beat"] + notes["duration_beat"])
+    return np.searchsorted(starts, beats, side="right") > np.searchsorted(
+        ends, beats, side="right"
+    )
 
 
 def score_position_variance(score_part, ref_frame_to_beat, n_frames):

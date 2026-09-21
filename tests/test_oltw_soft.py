@@ -56,10 +56,10 @@ class TestSoftOnlineTimeWarping(unittest.TestCase):
             score_file=score_file,
             performance_file=audio_file,
             input_type="audio",
-            method="softoltw",
+            method="soft_oltw",
             wait=False,
         )
-        self.assertIsInstance(mm.score_follower, SoftOnlineTimeWarping)
+        self.assertIs(type(mm.score_follower), SoftOnlineTimeWarping)
         from matchmaker.dp.oltw_imm import IMMPathFilter
 
         self.assertIsInstance(mm.score_follower.path, IMMPathFilter)
@@ -87,3 +87,55 @@ class TestSoftOnlineTimeWarping(unittest.TestCase):
         self.assertAlmostEqual(b_half, 1.5, places=4)
         b_quarter = tracker._frame_to_beat(2.25)
         self.assertAlmostEqual(b_quarter, 2.25, places=4)
+
+
+def test_only_two_soft_oltw_methods_are_registered():
+    from matchmaker import AVAILABLE_METHODS
+
+    assert {name for name in AVAILABLE_METHODS["audio"] if "soft" in name} == {
+        "soft_oltw",
+        "hierarchical_soft_oltw",
+    }
+
+
+def test_python_backend_matches_accelerated_acoustic_and_imm_paths(monkeypatch):
+    import matchmaker.dp.oltw_soft as module
+    from matchmaker.utils import distances
+
+    rng = np.random.default_rng(17)
+    features = rng.random((90, 12), dtype=np.float32) * 0.05
+    features[np.arange(90), np.arange(90) // 6 % 12] += 1.0
+    observations = features[np.repeat(np.arange(45), 2)]
+    expected = {}
+    for use_imm in (False, True):
+        for gamma in (0.0, 0.05, 0.5):
+            follower = SoftOnlineTimeWarping(features, gamma=gamma, use_imm=use_imm)
+            positions = [follower(frame, i) for i, frame in enumerate(observations)]
+            expected[use_imm, gamma] = positions, follower.path
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Python backend must not call accelerated kernels")
+
+    monkeypatch.setattr(module, "_weighted_soft_oltw_loop_numba", forbidden)
+    monkeypatch.setattr(distances, "vdist", forbidden)
+    monkeypatch.setattr(distances, "Manhattan", forbidden)
+    for (use_imm, gamma), (positions, path) in expected.items():
+        follower = SoftOnlineTimeWarping(
+            features, gamma=gamma, backend="python", use_imm=use_imm
+        )
+        for _ in range(2):
+            actual = [follower(frame, i) for i, frame in enumerate(observations)]
+            np.testing.assert_allclose(actual, positions, atol=1e-10)
+            np.testing.assert_allclose(follower.path.costs, path.costs, atol=1e-6)
+            if use_imm:
+                for attr in ("states", "covariances", "probabilities"):
+                    np.testing.assert_array_equal(
+                        getattr(follower.path, attr), getattr(path, attr)
+                    )
+            follower.reset()
+
+
+def test_soft_follower_directly_inherits_online_alignment():
+    from matchmaker.base import OnlineAlignment
+
+    assert SoftOnlineTimeWarping.__bases__ == (OnlineAlignment,)

@@ -1,14 +1,17 @@
 import numpy as np
+from scipy.special import ndtr
 
-from matchmaker.dp.oltw_soft import DEFAULT_GAMMA, SoftOnlineTimeWarping
-from matchmaker.prob.imm import (
-    DEFAULT_OBS_VAR,
-    IMMMotionModels,
-    score_position_variance,
-)
+DEFAULT_GAMMA: float = 0.05
 
 
 class IMMPathFilter:
+    """Candidate-wise IMM lattice used inside the online alignment.
+
+    Each reference frame retains motion states, covariances, mode probabilities
+    and cumulative cost. A step combines acoustic and motion evidence, updates
+    the Kalman states and moment-matches incoming paths for each motion mode.
+    """
+
     def __init__(self, model, variance, max_step):
         self.model = model
         self.variance = variance
@@ -46,6 +49,29 @@ class IMMPathFilter:
         self.covariances[position] = source.covariances[source.index]
         self.probabilities[position] = source.probabilities[source.index]
         self.state = self.probabilities[position] @ self.states[position]
+
+    def observe_silence(self, rest_frames):
+        if not self.model.enabled[2]:
+            return False
+        indices = np.flatnonzero(np.isfinite(self.costs))
+        priors, states, covariances = self.model.predict(
+            self.probabilities[indices], self.states[indices],
+            self.covariances[indices], self.variance,
+            allow_pause=True,
+        )
+        winner = int(np.searchsorted(indices, self.index))
+        mean = states[winner, :2, 0]
+        std = np.sqrt(covariances[winner, :2, 0, 0])
+        intervals = (rest_frames[:, :, None] - mean) / std
+        rest_likelihood = np.diff(ndtr(intervals), axis=1).sum(axis=(0, 1))
+        if priors[winner, :2] @ rest_likelihood > priors[winner, 2]:
+            return False
+        self.states[indices] = states
+        self.covariances[indices] = covariances
+        self.probabilities[indices] = 0
+        self.probabilities[indices, 2] = 1
+        self.state = self.states[self.index, 2].copy()
+        return True
 
     def step(self, distances, start, gamma, input_index, horizontal_weight):
         hard_min = gamma == 0
@@ -115,46 +141,3 @@ class IMMPathFilter:
         self.state = probabilities[winner] @ means[winner]
         self.index = int(positions[winner])
         return self.index, float(gamma * normalized[winner])
-
-
-class IMMOnlineTimeWarping(SoftOnlineTimeWarping):
-    def __init__(
-        self,
-        *args,
-        use_imm=True,
-        imm_modes=("cv", "ca", "zv"),
-        score_pause_gating=True,
-        correlated_observation=True,
-        obs_var=DEFAULT_OBS_VAR,
-        **kwargs,
-    ):
-        self.use_imm = use_imm
-        self.imm_modes = imm_modes
-        self.score_pause_gating = score_pause_gating
-        self.correlated_observation = correlated_observation
-        self.obs_var = obs_var
-        super().__init__(*args, **kwargs)
-
-    def _create_path(self):
-        if not self.use_imm:
-            return super()._create_path()
-        model = IMMMotionModels(
-            score_part=self.score_part,
-            ref_frame_to_beat=self._ref_frame_to_beat,
-            obs_var=self.obs_var,
-            tempo=self.tempo,
-            frame_rate=self.frame_rate,
-            modes=self.imm_modes,
-            score_pause_gating=self.score_pause_gating,
-        )
-        variance = score_position_variance(
-            self.score_part if self.correlated_observation else None,
-            self._ref_frame_to_beat,
-            self.N_ref,
-        )
-        return IMMPathFilter(model, variance, self.step_size)
-
-    def get_current_position(self):
-        if self.use_imm:
-            return self._frame_to_beat(self.path.position)
-        return super().get_current_position()

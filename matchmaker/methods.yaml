@@ -212,8 +212,8 @@ methods:
         window_size: 10
         frame_rate: 50
 
-    softoltw:
-      class: matchmaker.dp.oltw_imm:IMMOnlineTimeWarping
+    soft_oltw:
+      class: matchmaker.dp:SoftOnlineTimeWarping
       reference: score_audio
       args:
         <<: *oltw_frame_args

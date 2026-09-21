@@ -349,24 +349,65 @@ Default method: `"arzt"`
 | `"dixon"` | On-line time warping by Dixon (2005) |
 | `"outerhmm"` | Outer-product HMM score follower by Nakamura (2014) |
 | `"skf"` | Switching Kalman Filter with hidden tempo by Jiang and Raphael (2020) |
-| `"softoltw"` | Soft online time warping with an IMM for each alignment candidate |
+| `"soft_oltw"` | Soft online time warping with an IMM for each alignment candidate |
 | `"hierarchical_soft_oltw"` | Local IMM followers over a directed measure graph |
 
-Acoustic DP and streaming are in `matchmaker/dp/oltw_soft.py`, IMM path inference
-in `matchmaker/dp/oltw_imm.py`, and motion models in `matchmaker/prob/imm.py`.
-`softoltw` is the current implementation; historical variants remain in Git history.
+`soft_oltw` runs `SoftOnlineTimeWarping`: each candidate alignment position has
+its own IMM states, covariances and mode probabilities. `hierarchical_soft_oltw`
+maintains local IMM followers over a directed measure graph.
 
-| Ablation | Method options |
-|---|---|
-| w/o IMM | `use_imm=False` |
-| w/o softmin | `gamma=0` |
-| w/o noise correlation | `correlated_observation=False` |
+```mermaid
+classDiagram
+    OnlineAlignment <|-- SoftOnlineTimeWarping
+    OnlineAlignment <|-- HierarchicalSoftOnlineTimeWarping
+    HierarchicalSoftOnlineTimeWarping *-- GraphHypothesis
+    GraphHypothesis *-- SoftOnlineTimeWarping
+    HierarchicalSoftOnlineTimeWarping --> ScoreGraph
+    SoftOnlineTimeWarping *-- IMMPathFilter
+    IMMPathFilter *-- IMMMotionModels
+```
 
-Disabling IMM uses acoustic SoftOLTW without constructing any Kalman model.
-Disabling softmin selects one incoming path while retaining IMM model probabilities
-and the default acoustic cost scale. Disabling noise correlation removes the
-colored error state contribution while retaining independent observation noise.
-Motion-model subsets remain available through `imm_modes`.
+- `SoftOnlineTimeWarping` directly inherits `OnlineAlignment` and handles
+  streaming, feature distances, search windows and frame-to-beat conversion
+  (`matchmaker/dp/oltw_soft.py`). It uses IMM path inference by default.
+- Its internal `IMMPathFilter` combines acoustic costs with motion likelihoods
+  and merges incoming path states (`matchmaker/dp/oltw_imm.py`).
+- `IMMMotionModels` defines constant-velocity, constant-acceleration and pause
+  dynamics, score-based pause gating and correlated observation noise
+  (`matchmaker/prob/imm.py`). It is a component, not a standalone score follower.
+- `GraphHypothesis` holds a graph location, weight, local follower and traversal
+  counts. Graph data and MusicXML construction are in
+  `matchmaker/graph/score_graph.py`.
+
+The acoustic DP recurrence is Python with a Numba-compiled default backend.
+To run the alignment with Python/NumPy distance and path calculations:
+
+```python
+mm = Matchmaker(
+    score_file=score_file,
+    performance_file=audio_file,
+    method="soft_oltw",
+    kwargs={"backend": "python"},
+)
+```
+
+The IMM path is NumPy in both backends. `backend="python"` avoids JIT and custom
+Cython distance calls in the follower; feature extraction and other package
+components keep their own dependencies. The accelerated default is retained for
+real-time execution.
+
+Tunable alignment settings are `window_size`, `step_size`, `gamma` and
+`w_horizontal`; IMM settings include `obs_var` and `imm_modes`. Input data,
+`frame_rate`, `tempo` and `queue` come from the pipeline. Manhattan distance,
+the 0.1-second starting window and tempo-weighting history constants are fixed.
+Paper ablations use options on the same method: `use_imm=False`, `gamma=0`,
+`correlated_observation=False`, or mode subsets via `imm_modes`. They do not
+introduce additional registered methods.
+
+`use_silence=True` enables experimental ZV handling of exactly zero audio
+features in both IMM methods. It holds position while retaining the tempo for
+resumption, but allows predicted motion through notated rests. It does not
+detect pauses with nonzero microphone background noise and is off by default.
 
 ### MIDI (`input_type="midi"`)
 

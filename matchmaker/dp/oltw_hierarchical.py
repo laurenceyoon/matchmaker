@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 from numpy.typing import NDArray
 
 from matchmaker.base import OnlineAlignment
-from matchmaker.dp.oltw_soft import DEFAULT_GAMMA, DEFAULT_W_HORIZONTAL
-from matchmaker.dp.oltw_imm import IMMOnlineTimeWarping
+from matchmaker.dp.oltw_soft import (
+    DEFAULT_GAMMA,
+    DEFAULT_W_HORIZONTAL,
+    SoftOnlineTimeWarping,
+)
 from matchmaker.prob.imm import DEFAULT_OBS_VAR
 from matchmaker.features.audio import FRAME_RATE
-from matchmaker.graph.score_graph import ScoreGraph
+from matchmaker.graph.score_graph import EdgeKind, ScoreGraph
 from matchmaker.io.audio import QUEUE_TIMEOUT
 from matchmaker.io.queue import RECVQueue
 from matchmaker.utils.misc import set_latency_stats
@@ -30,9 +34,14 @@ def logsumexp(values: list[float]) -> float:
 class GraphHypothesis:
     node_id: str
     log_weight: float
-    follower: IMMOnlineTimeWarping
-    jump_counts: Dict[str, int] = field(default_factory=dict)
+    follower: SoftOnlineTimeWarping
+    route: tuple[str, ...] = ()
     last_score_beat: float = 0.0
+    branched: bool = False
+
+    @property
+    def jump_counts(self) -> dict[str, int]:
+        return dict(Counter(self.route))
 
 
 class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
@@ -115,71 +124,107 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
         self.current_index = self.node_start_frames[init_id]
         self.input_index = 0
 
-    def _make_local_follower(self, start_frame: int) -> IMMOnlineTimeWarping:
-        follower = IMMOnlineTimeWarping(
+    def _make_local_follower(self, start_frame: int) -> SoftOnlineTimeWarping:
+        follower = SoftOnlineTimeWarping(
             reference_features=self.reference_features,
             score_positions=self.score_positions,
             **self.local_options,
         )
         follower.reset(start_frame)
-        follower._music_started = True
         return follower
 
-    def _fork_hypothesis(self, parent: GraphHypothesis, target_node_id: str, prior_prob: float) -> GraphHypothesis:
+    def _fork_hypothesis(self, parent: GraphHypothesis, target_node_id: str, relative_weight: float) -> GraphHypothesis:
         target_frame = self.node_start_frames[target_node_id]
         child_follower = self._make_local_follower(target_frame)
 
         child_follower.path.restart_from(parent.follower.path, target_frame)
+        child_follower._music_started = parent.follower._music_started
+        child_follower.input_index = parent.follower.input_index
 
-        new_jumps = dict(parent.jump_counts)
         jump_key = f"{parent.node_id}->{target_node_id}"
-        new_jumps[jump_key] = new_jumps.get(jump_key, 0) + 1
 
         target_node = self.score_graph.nodes[target_node_id]
         return GraphHypothesis(
             node_id=target_node_id,
-            log_weight=parent.log_weight + math.log(max(prior_prob, 1e-6)),
+            log_weight=parent.log_weight + math.log(relative_weight),
             follower=child_follower,
-            jump_counts=new_jumps,
+            route=(*parent.route, jump_key),
             last_score_beat=target_node.score_beat,
         )
 
+    def _advance_node(self, hypothesis: GraphHypothesis) -> None:
+        node_id = hypothesis.node_id
+        current_start = self.score_graph.nodes[node_id].score_beat
+        for node in self.ordered_nodes:
+            if current_start < node.score_beat <= hypothesis.last_score_beat:
+                node_id = node.node_id
+        if node_id != hypothesis.node_id:
+            hypothesis.node_id = node_id
+            hypothesis.branched = False
+
+    def _expand(self, hypothesis: GraphHypothesis) -> list[GraphHypothesis]:
+        node_end = self.node_end_beats[hypothesis.node_id]
+        if hypothesis.last_score_beat < node_end - self.boundary_margin_beats:
+            return [hypothesis]
+        transitions = self.score_graph.transition_distribution(hypothesis.node_id)
+        jumps = [(edge, probability) for edge, probability in transitions
+                 if edge.kind not in (EdgeKind.LINEAR, EdgeKind.STAY)]
+        if not jumps:
+            return [hypothesis]
+        continuation = sum(probability for edge, probability in transitions
+                           if edge.kind in (EdgeKind.LINEAR, EdgeKind.STAY))
+        if not continuation:
+            return [self._fork_hypothesis(hypothesis, edge.target, probability)
+                    for edge, probability in jumps]
+        if not hypothesis.branched:
+            hypothesis.log_weight += math.log(continuation)
+            hypothesis.branched = True
+        children = [self._fork_hypothesis(hypothesis, edge.target, probability / continuation)
+                    for edge, probability in jumps]
+        return [hypothesis, *children]
+
     def step(self, features: NDArray[np.float32]) -> None:
-        new_hypotheses: List[GraphHypothesis] = []
+        audible = not self.local_options.get("use_silence", False) or bool(features.any())
+        candidates = []
+        for hypothesis in self.hypotheses:
+            candidates.extend(self._expand(hypothesis) if audible else [hypothesis])
+        for hypothesis in candidates:
+            follower = hypothesis.follower
+            follower.path.costs[:self.node_start_frames[hypothesis.node_id]] = np.inf
+            follower.step(features)
+            hypothesis.last_score_beat = follower.get_current_position()
+            if audible and follower._music_started:
+                frame = follower.path.index
+                distance = follower.vdist(
+                    self.reference_features[frame:frame + 1],
+                    features.squeeze(), follower.distance_func,
+                )[0]
+                hypothesis.log_weight -= float(distance) / (follower.gamma or DEFAULT_GAMMA)
+            self._advance_node(hypothesis)
 
-        for hyp in self.hypotheses:
-            hyp.follower.step(features)
-            current_beat = hyp.follower.get_current_position()
-            hyp.last_score_beat = current_beat
-
-            new_hypotheses.append(hyp)
-
-            node_end = self.node_end_beats.get(hyp.node_id, float("inf"))
-            if current_beat >= node_end - self.boundary_margin_beats:
-                for edge, trans_prob in self.score_graph.transition_distribution(hyp.node_id):
-                    if edge.target != hyp.node_id:
-                        times = int(edge.metadata.get("times", 2))
-                        jump_key = f"{hyp.node_id}->{edge.target}"
-                        if hyp.jump_counts.get(jump_key, 0) < times:
-                            new_hypotheses.append(self._fork_hypothesis(hyp, edge.target, trans_prob))
-
-        if len(new_hypotheses) > self.beam_size:
-            new_hypotheses.sort(key=lambda h: h.log_weight, reverse=True)
-            new_hypotheses = new_hypotheses[: self.beam_size]
-
-        total_log_weight = logsumexp([h.log_weight for h in new_hypotheses])
-        for h in new_hypotheses:
-            h.log_weight -= total_log_weight
-
-        self.hypotheses = new_hypotheses
-
-        best_hyp = max(self.hypotheses, key=lambda h: h.log_weight)
-        self.current_position = best_hyp.follower.get_current_position()
-        self.current_index = best_hyp.follower.current_index
+        routes = {}
+        for hypothesis in candidates:
+            key = hypothesis.route
+            if key not in routes or hypothesis.log_weight > routes[key].log_weight:
+                routes[key] = hypothesis
+        candidates = list(routes.values())
+        candidates.sort(key=lambda h: h.log_weight, reverse=True)
+        self.hypotheses = candidates[:self.beam_size]
+        total = logsumexp([h.log_weight for h in self.hypotheses])
+        for hypothesis in self.hypotheses:
+            hypothesis.log_weight -= total
+        self.hypotheses = [h for h in self.hypotheses
+                           if h.log_weight >= math.log(np.finfo(float).eps)]
+        best = self.hypotheses[0]
+        self.current_position = best.follower.get_current_position()
+        self.current_index = best.follower.current_index
         self.input_index += 1
 
     def get_current_position(self) -> float:
         return self.current_position
+
+    def is_still_following(self) -> bool:
+        return True
 
     def reset(self) -> None:
         self.input_index = 0

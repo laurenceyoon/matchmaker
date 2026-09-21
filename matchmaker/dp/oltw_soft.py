@@ -1,34 +1,30 @@
 import time
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numba
 import numpy as np
 from numpy.typing import NDArray
 
 from matchmaker.base import OnlineAlignment
+from matchmaker.dp.oltw_imm import DEFAULT_GAMMA, IMMPathFilter
+from matchmaker.prob.imm import (
+    DEFAULT_OBS_VAR,
+    IMMMotionModels,
+    score_position_variance,
+    score_activity,
+)
 from matchmaker.features.audio import FRAME_RATE
 from matchmaker.io.audio import QUEUE_TIMEOUT
 from matchmaker.io.queue import RECVQueue
-from matchmaker.utils import (
-    CYTHONIZED_METRICS_W_ARGUMENTS,
-    CYTHONIZED_METRICS_WO_ARGUMENTS,
-    distances,
-)
-from matchmaker.utils.distances import Metric, vdist
-from matchmaker.utils.errors import (
-    MatchmakerInvalidOptionError,
-    MatchmakerInvalidParameterTypeError,
-)
 from matchmaker.utils.misc import set_latency_stats
 
-DEFAULT_GAMMA: float = 0.05
 DEFAULT_W_HORIZONTAL: float = 10.0
 DEFAULT_TEMPO_LOOKBACK_SEC: float = 1.0
 DEFAULT_VELOCITY_SCALE: float = 0.35
 DEFAULT_MIN_HISTORY_SEC: float = 0.33
 
 
-@numba.njit(cache=True)
+@numba.extending.register_jitable
 def softmin(a: float, b: float, c: float, gamma: float) -> float:
     """Soft minimum via log-sum-exp."""
     min_val = min(a, b, c)
@@ -42,7 +38,6 @@ def softmin(a: float, b: float, c: float, gamma: float) -> float:
     return min_val - gamma * np.log(exp_sum + 1e-10)
 
 
-@numba.njit(cache=True)
 def weighted_soft_oltw_loop(
     global_cost_matrix: np.ndarray,
     window_cost: np.ndarray,
@@ -88,16 +83,38 @@ def weighted_soft_oltw_loop(
     return global_cost_matrix, min_index, min_costs
 
 
+_weighted_soft_oltw_loop_numba = numba.njit(cache=True)(weighted_soft_oltw_loop)
+
+
+def _manhattan(x, y):
+    return np.abs(x - y).sum()
+
+
+def _python_vdist(x, y, metric):
+    # Sequential float32 accumulation matches the accelerated Manhattan metric.
+    return np.add.accumulate(np.abs(x - y), axis=1)[:, -1]
+
+
 class SoftWarpingPath:
-    def __init__(self, size):
+    """Acoustic DP state; both backends execute the same Python recurrence."""
+
+    def __init__(self, size, backend="numba"):
         self.size = size
+        self._loop = (
+            _weighted_soft_oltw_loop_numba
+            if backend == "numba"
+            else weighted_soft_oltw_loop
+        )
 
     def reset(self, position=0):
         self.costs = np.full((self.size + 1, 2), np.inf)
         self.index = position
 
+    def observe_silence(self, rest_frames):
+        return False
+
     def step(self, distances, start, gamma, input_index, horizontal_weight):
-        self.costs, self.index, cost = weighted_soft_oltw_loop(
+        self.costs, self.index, cost = self._loop(
             self.costs,
             distances,
             start,
@@ -112,7 +129,11 @@ class SoftWarpingPath:
 
 
 class SoftOnlineTimeWarping(OnlineAlignment):
-    DEFAULT_DISTANCE_FUNC: str = "Manhattan"
+    """Soft-OLTW score follower with candidate-wise IMM path inference.
+
+    ``backend="python"`` uses Python/NumPy alignment calculations.
+    ``use_imm=False`` selects acoustic DP for the paper ablation.
+    """
 
     def __init__(
         self,
@@ -122,18 +143,19 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         step_size: int = 3,
         gamma: float = DEFAULT_GAMMA,
         w_horizontal: float = DEFAULT_W_HORIZONTAL,
-        score_part: Any = None,
-        distance_func: Union[
-            str, Callable, Tuple[str, Dict[str, Any]]
-        ] = DEFAULT_DISTANCE_FUNC,
-        start_window_size: Union[float, int] = 0.1,
         frame_rate: int = FRAME_RATE,
         ref_frame_to_beat: Optional[NDArray] = None,
         queue: Optional[RECVQueue] = None,
+        backend: str = "numba",
+        *,
+        score_part: Any = None,
         tempo: float = 120.0,
-        tempo_lookback_sec: float = DEFAULT_TEMPO_LOOKBACK_SEC,
-        velocity_scale: float = DEFAULT_VELOCITY_SCALE,
-        min_history_sec: float = DEFAULT_MIN_HISTORY_SEC,
+        use_imm: bool = True,
+        use_silence: bool = False,
+        imm_modes: Tuple[str, ...] = ("cv", "ca", "zv"),
+        score_pause_gating: bool = True,
+        correlated_observation: bool = True,
+        obs_var: float = DEFAULT_OBS_VAR,
     ) -> None:
         if ref_frame_to_beat is None and score_positions is not None:
             ref_frame_to_beat = score_positions
@@ -147,20 +169,16 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         )
         self.N_ref: int = self.reference_features.shape[0]
         self.frame_rate = frame_rate
-        self.tempo = float(tempo)
-        self.tempo_lookback_sec = float(tempo_lookback_sec)
-        self.velocity_scale = float(velocity_scale)
-        self.min_history_sec = float(min_history_sec)
         self._lookback_frames = max(
-            1, int(np.round(self.tempo_lookback_sec * self.frame_rate))
+            1, int(np.round(DEFAULT_TEMPO_LOOKBACK_SEC * self.frame_rate))
         )
         self._min_history_frames = max(
-            2, int(np.round(self.min_history_sec * self.frame_rate))
+            2, int(np.round(DEFAULT_MIN_HISTORY_SEC * self.frame_rate))
         )
         self._ref_frame_to_beat = ref_frame_to_beat
         self.step_size = step_size
         self._window_size = int(np.round(window_size * self.frame_rate))
-        self._start_window_size = int(np.round(start_window_size * frame_rate))
+        self._start_window_size = int(np.round(0.1 * frame_rate))
         self.queue_timeout = QUEUE_TIMEOUT
         self.latency_stats: Dict[str, float] = {
             "total_latency": 0,
@@ -168,55 +186,51 @@ class SoftOnlineTimeWarping(OnlineAlignment):
             "max_latency": 0,
             "min_latency": float("inf"),
         }
-        self._init_distance_func(distance_func)
+        if backend not in ("numba", "python"):
+            raise ValueError("backend must be 'numba' or 'python'")
+        self.backend = backend
+        if backend == "python":
+            self.distance_func, self.vdist = _manhattan, _python_vdist
+        else:
+            from matchmaker.utils.distances import Manhattan, vdist
+
+            self.distance_func, self.vdist = Manhattan(), vdist
 
         self.gamma = gamma
         self.w_horizontal = w_horizontal
+        self.use_imm = use_imm
+        self.use_silence = use_silence
+        sounding = score_activity(score_part, ref_frame_to_beat, self.N_ref)
+        self.rest_frames = np.flatnonzero(np.diff(np.r_[True, sounding, True])).reshape(-1, 2)
         self.score_part = score_part
+        self.tempo = float(tempo)
+        self.imm_modes = imm_modes
+        self.score_pause_gating = score_pause_gating
+        self.correlated_observation = correlated_observation
+        self.obs_var = obs_var
         self.path = self._create_path()
 
         self.reset()
 
-    def _init_distance_func(
-        self, distance_func: Union[str, Callable, Tuple[str, Dict[str, Any]]]
-    ) -> None:
-        if not (isinstance(distance_func, (str, tuple)) or callable(distance_func)):
-            raise MatchmakerInvalidParameterTypeError(
-                parameter_name="distance_func",
-                required_parameter_type=(str, tuple, Callable),
-                actual_parameter_type=type(distance_func),
-            )
-
-        if isinstance(distance_func, str):
-            if distance_func not in CYTHONIZED_METRICS_WO_ARGUMENTS:
-                raise MatchmakerInvalidOptionError(
-                    parameter_name="distance_func",
-                    valid_options=CYTHONIZED_METRICS_WO_ARGUMENTS,
-                    value=distance_func,
-                )
-            self.distance_func = getattr(distances, distance_func)()
-        elif isinstance(distance_func, tuple):
-            if distance_func[0] not in CYTHONIZED_METRICS_W_ARGUMENTS:
-                raise MatchmakerInvalidOptionError(
-                    parameter_name="distance_func",
-                    valid_options=CYTHONIZED_METRICS_W_ARGUMENTS,
-                    value=distance_func[0],
-                )
-            self.distance_func = getattr(distances, distance_func[0])(
-                **distance_func[1]
-            )
-        elif callable(distance_func):
-            self.distance_func = distance_func
-
-        if isinstance(self.distance_func, Metric):
-            self.vdist = vdist
-        else:
-            self.vdist = lambda X, y, lcf: np.array([lcf(x, y) for x in X]).astype(
-                np.float32
-            )
-
     def _create_path(self):
-        return SoftWarpingPath(self.N_ref)
+        if not self.use_imm:
+            return SoftWarpingPath(self.N_ref, self.backend)
+        model = IMMMotionModels(
+            score_part=self.score_part,
+            ref_frame_to_beat=self._ref_frame_to_beat,
+            obs_var=self.obs_var,
+            tempo=self.tempo,
+            frame_rate=self.frame_rate,
+            modes=self.imm_modes,
+            score_pause_gating=self.score_pause_gating,
+            retain_tempo=self.use_silence,
+        )
+        variance = score_position_variance(
+            self.score_part if self.correlated_observation else None,
+            self._ref_frame_to_beat,
+            self.N_ref,
+        )
+        return IMMPathFilter(model, variance, self.step_size)
 
     def reset(self, position=0) -> None:
         self.current_index = self._frame_to_score_idx(position)
@@ -255,7 +269,8 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         return max(0, min(idx, len(self.score_positions) - 1))
 
     def get_current_position(self) -> float:
-        return self._frame_to_beat(self._current_frame)
+        frame = self.path.position if self.use_imm else self._current_frame
+        return self._frame_to_beat(frame)
 
     def get_window(self) -> Tuple[int, int]:
         w = self._window_size
@@ -291,6 +306,10 @@ class SoftOnlineTimeWarping(OnlineAlignment):
                 return
             self._music_started = True
 
+        if self.use_silence and not feat.any():
+            if self.path.observe_silence(self.rest_frames):
+                return
+
         window_start, window_end = self.get_window()
         window_cost = self.vdist(
             self.reference_features[window_start:window_end],
@@ -304,7 +323,7 @@ class SoftOnlineTimeWarping(OnlineAlignment):
             recent_tempo = (
                 self._current_frame - self._pos_history[-lookback]
             ) / lookback
-        excess_tempo = (recent_tempo - 1.0) / self.velocity_scale
+        excess_tempo = (recent_tempo - 1.0) / DEFAULT_VELOCITY_SCALE
         horizontal_weight = 1.0 + (self.w_horizontal - 1.0) * np.clip(
             excess_tempo, 0.0, 1.0
         )
