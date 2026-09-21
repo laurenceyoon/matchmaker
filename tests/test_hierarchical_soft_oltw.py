@@ -145,8 +145,12 @@ def repeated_sections():
 
 
 @pytest.mark.parametrize("repeat_first", [False, True])
-def test_acoustic_evidence_selects_repeat_or_continue(repeated_sections, repeat_first):
+@pytest.mark.parametrize("trailing_rest", [0, 6])
+def test_acoustic_evidence_selects_repeat_or_continue(
+    repeated_sections, repeat_first, trailing_rest
+):
     follower = repeated_sections
+    follower.node_end_beats["3"] += trailing_rest
     first = np.arange(30)
     second = np.arange(30, 60)
     route = np.concatenate([first] * (1 + repeat_first) + [second, second])
@@ -175,6 +179,25 @@ def test_branch_priors_are_applied_once_per_visit(repeated_sections):
         np.testing.assert_allclose([np.exp(h.log_weight) for h in candidates], [0.5, 0.5])
         assert candidates[1].route == ("1->0",)
         assert parent.route == ()
+
+
+def test_filtered_position_cannot_close_repeat_before_alignment(repeated_sections):
+    follower = repeated_sections
+    parent = follower.hypotheses[0]
+    parent.node_id = "1"
+    parent.follower.reset(29)
+    parent.follower.path.state[0] = 31
+    parent.last_score_beat = parent.follower.get_current_position()
+
+    follower._advance_node(parent)
+
+    assert parent.node_id == "1"
+    assert len(follower._expand(parent)) == 2
+
+    parent.follower.path.index = 30
+    follower._advance_node(parent)
+
+    assert parent.node_id == "2"
 
 
 def test_ambiguous_observation_preserves_both_routes(repeated_sections):

@@ -155,15 +155,18 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
     def _advance_node(self, hypothesis: GraphHypothesis) -> None:
         node_id = hypothesis.node_id
         current_start = self.score_graph.nodes[node_id].score_beat
+        aligned_beat = self.ref_frame_to_beat[hypothesis.follower.path.index]
         for node in self.ordered_nodes:
-            if current_start < node.score_beat <= hypothesis.last_score_beat:
+            if current_start < node.score_beat <= aligned_beat:
                 node_id = node.node_id
         if node_id != hypothesis.node_id:
             hypothesis.node_id = node_id
             hypothesis.branched = False
 
     def _expand(self, hypothesis: GraphHypothesis) -> list[GraphHypothesis]:
-        node_end = self.node_end_beats[hypothesis.node_id]
+        node_end = min(
+            self.node_end_beats[hypothesis.node_id], self.ref_frame_to_beat[-1]
+        )
         if hypothesis.last_score_beat < node_end - self.boundary_margin_beats:
             return [hypothesis]
         transitions = self.score_graph.transition_distribution(hypothesis.node_id)
