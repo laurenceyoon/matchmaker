@@ -11,10 +11,16 @@ from matchmaker import EXAMPLE_PIECES, Matchmaker
 from matchmaker.dp.oltw_soft import (
     ScoreInformedIMM,
     SoftOnlineTimeWarping,
+    softmin,
 )
 from tests.utils import generate_example_sequences
 
 RNG = np.random.RandomState(42)
+
+
+def test_zero_gamma_selects_hard_minimum():
+    assert softmin(3., 1., 2., 0.) == 1.
+    assert softmin(np.inf, np.inf, np.inf, 0.) == np.inf
 
 
 class TestSoftOnlineTimeWarping(unittest.TestCase):

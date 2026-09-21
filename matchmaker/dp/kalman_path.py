@@ -12,7 +12,7 @@ class KalmanPathLattice:
         self.states = np.column_stack((np.arange(size), np.ones(size)))
         self.covariances = np.tile(np.diag([variance, 1.]), (size, 1, 1))
 
-    def step(self, distances, start, gamma, input_index, horizontal_weight):
+    def step(self, distances, start, gamma, input_index, horizontal_weight, hard_min=False):
         if input_index == 0:
             self.costs[0] = float(np.sum(distances)) / gamma
             return 0, float(distances[0])
@@ -34,6 +34,8 @@ class KalmanPathLattice:
         minima = np.min(costs, axis=1)
         minima = np.where(reachable, minima, 0.)
         weights = np.exp(minima[:, None] - costs)
+        if hard_min:
+            weights = np.eye(len(self.steps))[np.argmin(costs, axis=1)] * reachable[:, None]
         totals = weights.sum(axis=1)
         weights = np.divide(weights, totals[:, None], out=np.zeros_like(weights), where=totals[:, None] > 0)
         cross = covariances[:, :, :, 0].copy()

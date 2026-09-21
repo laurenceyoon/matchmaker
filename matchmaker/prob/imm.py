@@ -20,9 +20,13 @@ class ScoreInformedIMM:
         obs_var: float = DEFAULT_OBS_VAR,
         tempo: float = 120.0,
         frame_rate: int = FRAME_RATE,
+        modes: Tuple[str, ...] = ("cv", "ca", "zv"),
     ):
         if obs_var <= 0 or tempo <= 0 or frame_rate <= 0:
             raise ValueError("Observation variance, tempo and frame rate must be positive")
+        self.enabled = np.array([mode in modes for mode in ("cv", "ca", "zv")])
+        if not self.enabled[:2].any():
+            raise ValueError("At least one moving mode is required")
         self.R = float(obs_var)
         self.H = np.array([1.0, 0.0, 0.0, 1.0])
         self.score_part = score_part
@@ -91,14 +95,15 @@ class ScoreInformedIMM:
         return sorted(set(ranges))
 
     def _transition_matrix(self, allow_pause: bool) -> np.ndarray:
-        n = 3 if allow_pause else 2
-        durations = np.array([self.measure_seconds, self.beat_seconds, self.beat_seconds])[:n]
-        generator = np.ones((n, n)) / (durations[:, None] * (n - 1))
-        np.fill_diagonal(generator, -1 / durations)
+        active = np.flatnonzero(self.enabled & np.array([True, True, allow_pause]))
+        n = len(active)
+        durations = np.array([self.measure_seconds, self.beat_seconds, self.beat_seconds])[active]
         matrix = np.zeros((3, 3))
-        matrix[:n, :n] = expm(generator * self.dt)
-        if not allow_pause:
-            matrix[2, :2] = 1 / 2
+        matrix[:, active] = 1 / n
+        if n > 1:
+            generator = np.ones((n, n)) / (durations[:, None] * (n - 1))
+            np.fill_diagonal(generator, -1 / durations)
+            matrix[np.ix_(active, active)] = expm(generator * self.dt)
         return matrix
 
     def _combine(self, probabilities: np.ndarray) -> None:
@@ -127,7 +132,8 @@ class ScoreInformedIMM:
     def reset(self, position: float = 0.0, tempo: float = 1.0) -> None:
         velocity = tempo / self.dt
 
-        self.mu = np.array([1.0, 0.0, 0.0])
+        self.mu = np.zeros(3)
+        self.mu[np.flatnonzero(self.enabled[:2])[0]] = 1.0
         self.c_bar = self.mu.copy()
         self.states = np.array([[position, velocity, 0.0],
                                 [position, velocity, 0.0], [position, 0.0, 0.0]])

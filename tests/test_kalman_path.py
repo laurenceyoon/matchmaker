@@ -52,3 +52,27 @@ def test_motion_covariance_matches_observation_scale_over_one_beat():
     for _ in range(15):
         covariance = model.F @ covariance @ model.F.T + model.Q
     np.testing.assert_allclose(covariance[0, 0], model.R)
+
+
+def test_hard_min_keeps_best_branch_and_its_posterior():
+    model = KalmanPathLattice(12, 5., 15., 3)
+    distances = np.linspace(.1, .6, 6)
+    model.step(distances, 0, .05, 0, 1., hard_min=True)
+    model.step(distances, 0, .05, 1, 1., hard_min=True)
+    position = 2
+    branches = []
+    for ancestor in range(position + 1):
+        state = model.F @ model.states[ancestor]
+        covariance = model.F @ model.covariances[ancestor] @ model.F.T + model.Q
+        residual = position - state[0]
+        variance = covariance[0, 0] + model.R
+        acoustic = distances[position] if ancestor == position else distances[ancestor + 1:position + 1].sum()
+        cost = model.costs[ancestor] + .5 * (residual**2 / variance + np.log(2 * np.pi * variance)) + acoustic / .05
+        cross = covariance[:, 0].copy()
+        branches.append((cost, state + cross * residual / variance,
+                         covariance - np.outer(cross, cross) / variance))
+    cost, state, covariance = min(branches, key=lambda branch: branch[0])
+    model.step(distances, 0, .05, 2, 1., hard_min=True)
+    np.testing.assert_allclose(model.costs[position], cost)
+    np.testing.assert_allclose(model.states[position], state)
+    np.testing.assert_allclose(model.covariances[position], covariance)

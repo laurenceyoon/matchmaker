@@ -48,7 +48,8 @@ def test_covariance_and_probabilities_remain_valid_at_pause_and_resume():
 def test_scalar_reference_imm_equations_match_vectorized_implementation():
     imm = ScoreInformedIMM()
     imm.mu = np.array([0.3, 0.6, 0.1])
-    imm.states[:, :3] = np.array([[40.,30.,0.],[41.,35.,4.],[39.,0.,0.]])
+    imm.states[:] = np.array([[40.,30.,0.,2.],[41.,35.,4.,-1.],[39.,0.,0.,3.]])
+    imm.set_observation_error(4.0, initialize=True)
     states, covs = imm.states.copy(), imm.P_matrices.copy()
     c = imm.mu @ imm.M_pause
     omega = imm.mu[:,None] * imm.M_pause / c
@@ -64,11 +65,12 @@ def test_scalar_reference_imm_equations_match_vectorized_implementation():
     z = 42.
     likelihoods = []
     for j in range(3):
-        y = z - expected_x[j][0]
-        S = expected_p[j][0,0] + imm.R
-        K = expected_p[j][:,0] / S
+        y = z - imm.H @ expected_x[j]
+        cross = expected_p[j] @ imm.H
+        S = imm.H @ cross + imm.R
+        K = cross / S
         expected_x[j] += K * y
-        expected_p[j] -= np.outer(K, expected_p[j][0])
+        expected_p[j] -= np.outer(K, cross)
         likelihoods.append(np.exp(-y*y/(2*S))/np.sqrt(2*np.pi*S))
     mu = c * likelihoods
     mu /= mu.sum()
@@ -76,6 +78,11 @@ def test_scalar_reference_imm_equations_match_vectorized_implementation():
     np.testing.assert_allclose(imm.mu, mu)
     np.testing.assert_allclose(imm.states, expected_x)
     np.testing.assert_allclose(imm.P_matrices, expected_p, atol=1e-10)
+    mean = sum(mu[j] * expected_x[j] for j in range(3))
+    covariance = sum(mu[j] * (expected_p[j] + np.outer(expected_x[j] - mean, expected_x[j] - mean))
+                     for j in range(3))
+    np.testing.assert_allclose(imm.state, mean)
+    np.testing.assert_allclose(imm.P, covariance, atol=1e-10)
 
 
 def test_score_repeated_chord_duration_defines_uncertainty():
@@ -142,3 +149,40 @@ def test_uncertain_observation_weights_prediction_more():
     certain.update(10.0)
     uncertain.update(10.0, obs_var=1000.0)
     assert abs(uncertain.position - prediction) < abs(certain.position - prediction)
+
+
+def test_removed_modes_never_receive_probability():
+    for removed in ("cv", "ca", "zv"):
+        modes = tuple(mode for mode in ("cv", "ca", "zv") if mode != removed)
+        imm = ScoreInformedIMM(modes=modes)
+        disabled = ("cv", "ca", "zv").index(removed)
+        for matrix in (imm.M_play, imm.M_pause):
+            np.testing.assert_allclose(matrix.sum(axis=1), 1.)
+            assert np.all(matrix[:, disabled] == 0.)
+        for frame in range(50):
+            imm.predict(is_silent=20 <= frame < 30)
+            imm.update(float(frame))
+            assert imm.mu[disabled] == 0.
+            assert np.isfinite(imm.state).all()
+            assert np.linalg.eigvalsh(imm.P).min() > -1e-10
+
+
+def test_single_mode_reduces_to_ordinary_kalman_recursion():
+    for index, mode in enumerate(('cv', 'ca')):
+        imm = ScoreInformedIMM(modes=(mode,))
+        imm.set_observation_error(4., initialize=True)
+        state = imm.states[index].copy()
+        covariance = imm.P_matrices[index].copy()
+        for frame in range(1, 31):
+            state = imm.F[index] @ state
+            covariance = imm.F[index] @ covariance @ imm.F[index].T + imm.Q[index]
+            observation = frame + np.sin(frame)
+            cross = covariance @ imm.H
+            gain = cross / (imm.H @ cross + imm.R)
+            state += gain * (observation - imm.H @ state)
+            covariance -= np.outer(gain, cross)
+            imm.predict(is_silent=frame > 15)
+            imm.update(observation)
+            assert imm.mu[index] == 1.
+            np.testing.assert_allclose(imm.state, state, atol=1e-10)
+            np.testing.assert_allclose(imm.P, covariance, atol=1e-10)
