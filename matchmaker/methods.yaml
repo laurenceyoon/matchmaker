@@ -238,6 +238,18 @@ methods:
         use_imm: true
         path_tempo: true
 
+    joint_imm:
+      class: matchmaker.dp.oltw_imm:IMMOnlineTimeWarping
+      reference: score_audio
+      args:
+        <<: *oltw_frame_args
+        score_part: {from: score_part}
+        tempo: {from: tempo}
+      config_passthrough: true
+      default_kwargs:
+        window_size: 10
+        step_size: 3
+
     softoltw_no_imm:
       class: matchmaker.dp:SoftOnlineTimeWarping
       reference: score_audio

@@ -87,16 +87,17 @@ def plot_alignment_path(perf_sec, score_beat, gt_perf, gt_score, save_path, run_
     plt.close(fig)
 
 
-def save_results(save_dir, run_name, results, perf_sec, score_beat, gt_perf, gt_score):
-    """Save wp/gt TSVs, results JSON, and the alignment path plot."""
+def save_results(save_dir, run_name, results, perf_sec, score_beat, gt_perf, gt_score, save_plots=True):
+    """Save alignment data, metrics, and an optional plot."""
     save_dir.mkdir(parents=True, exist_ok=True)
     save_tsv(np.column_stack([perf_sec, score_beat]), save_dir / f"wp_{run_name}.tsv")
     save_tsv(np.column_stack([gt_perf, gt_score]), save_dir / f"gt_{run_name}.tsv")
     with open(save_dir / f"{run_name}.json", "w") as f:
         json.dump(results, f, indent=4)
-    plot_alignment_path(
-        perf_sec, score_beat, gt_perf, gt_score, save_dir / f"{run_name}.png", run_name
-    )
+    if save_plots:
+        plot_alignment_path(
+            perf_sec, score_beat, gt_perf, gt_score, save_dir / f"{run_name}.png", run_name
+        )
 
 
 def main():
@@ -123,6 +124,8 @@ def main():
     parser.add_argument("--midi-file", type=str, default=None, help="Path to custom performance MIDI file")
     parser.add_argument("--match", type=str, default=None, help="Path to custom .match ground truth file")
     parser.add_argument("--unfold", action="store_true", help="Unfold score repetitions during load")
+    parser.add_argument("--no-plots", action="store_true", help="Skip alignment plots")
+    parser.add_argument("--output-dir", type=Path, default=ROOT_DIR / "results", help="Result directory")
     args = parser.parse_args()
 
     input_mode = "midi" if args.midi else "audio"
@@ -174,9 +177,10 @@ def main():
         results, perf_sec, score_beat, gt_perf, gt_score = evaluate(mm, match_file)
         print(f"Evaluation Result: {json.dumps(results, indent=4)}")
 
-        results_dir = ROOT_DIR / "results"
+        results_dir = args.output_dir
         save_results(
-            results_dir, f"{run_name}_{method}", results, perf_sec, score_beat, gt_perf, gt_score
+            results_dir, f"{run_name}_{method}", results, perf_sec, score_beat, gt_perf, gt_score,
+            save_plots=not args.no_plots,
         )
         print(f"Detailed evaluation results saved in {results_dir}")
     else:
