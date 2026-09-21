@@ -117,7 +117,7 @@ def main():
         "--method",
         type=str,
         default=None,
-        help="Score following method (e.g., oltw_soft, arzt, dixon, outerhmm)",
+        help="Score following method (e.g., softoltw, arzt, dixon, outerhmm)",
     )
     parser.add_argument("--score", type=str, default=None, help="Path to custom score XML/MusicXML")
     parser.add_argument("--audio-file", type=str, default=None, help="Path to custom performance audio file")
@@ -126,6 +126,7 @@ def main():
     parser.add_argument("--unfold", action="store_true", help="Unfold score repetitions during load")
     parser.add_argument("--no-plots", action="store_true", help="Skip alignment plots")
     parser.add_argument("--output-dir", type=Path, default=ROOT_DIR / "results", help="Result directory")
+    parser.add_argument("--kwargs", type=json.loads, default={}, help="Method option overrides")
     args = parser.parse_args()
 
     input_mode = "midi" if args.midi else "audio"
@@ -150,7 +151,7 @@ def main():
     if args.method is not None:
         method = args.method
     else:
-        method = "pthmm" if input_mode == "midi" else "oltw_soft"
+        method = "pthmm" if input_mode == "midi" else "softoltw"
 
     # Initialize matchmaker (simulation mode)
     try:
@@ -160,6 +161,7 @@ def main():
             input_type=input_mode,
             method=method,
             unfold_score=args.unfold,
+            kwargs=args.kwargs or None,
         )
     except Empty as e:
         print(f"Error initializing Matchmaker: {e}")

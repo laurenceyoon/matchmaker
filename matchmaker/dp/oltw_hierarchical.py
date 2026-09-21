@@ -9,7 +9,9 @@ import numpy as np
 from numpy.typing import NDArray
 
 from matchmaker.base import OnlineAlignment
-from matchmaker.dp.oltw_soft import DEFAULT_GAMMA, DEFAULT_OBS_VAR, DEFAULT_W_HORIZONTAL, SoftOnlineTimeWarping
+from matchmaker.dp.oltw_soft import DEFAULT_GAMMA, DEFAULT_W_HORIZONTAL
+from matchmaker.dp.oltw_imm import IMMOnlineTimeWarping
+from matchmaker.prob.imm import DEFAULT_OBS_VAR
 from matchmaker.features.audio import FRAME_RATE
 from matchmaker.graph.score_graph import ScoreGraph
 from matchmaker.io.audio import QUEUE_TIMEOUT
@@ -28,7 +30,7 @@ def logsumexp(values: list[float]) -> float:
 class GraphHypothesis:
     node_id: str
     log_weight: float
-    follower: SoftOnlineTimeWarping
+    follower: IMMOnlineTimeWarping
     jump_counts: Dict[str, int] = field(default_factory=dict)
     last_score_beat: float = 0.0
 
@@ -113,14 +115,13 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
         self.current_index = self.node_start_frames[init_id]
         self.input_index = 0
 
-    def _make_local_follower(self, start_frame: int) -> SoftOnlineTimeWarping:
-        follower = SoftOnlineTimeWarping(
+    def _make_local_follower(self, start_frame: int) -> IMMOnlineTimeWarping:
+        follower = IMMOnlineTimeWarping(
             reference_features=self.reference_features,
             score_positions=self.score_positions,
             **self.local_options,
         )
-        follower._current_frame = start_frame
-        follower.current_index = follower._frame_to_score_idx(start_frame)
+        follower.reset(start_frame)
         follower._music_started = True
         return follower
 
@@ -128,9 +129,7 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
         target_frame = self.node_start_frames[target_node_id]
         child_follower = self._make_local_follower(target_frame)
 
-        p_imm, c_imm = parent.follower.kalman, child_follower.kalman
-        c_imm.states[:, 1] = p_imm.states[:, 1]
-        c_imm.mu = p_imm.mu.copy()
+        child_follower.path.restart_from(parent.follower.path, target_frame)
 
         new_jumps = dict(parent.jump_counts)
         jump_key = f"{parent.node_id}->{target_node_id}"

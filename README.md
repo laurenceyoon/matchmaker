@@ -349,15 +349,24 @@ Default method: `"arzt"`
 | `"dixon"` | On-line time warping by Dixon (2005) |
 | `"outerhmm"` | Outer-product HMM score follower by Nakamura (2014) |
 | `"skf"` | Switching Kalman Filter with hidden tempo by Jiang and Raphael (2020) |
-| `"softoltw"` | Soft on-line time warping with path-conditioned Kalman tempo estimates and score-informed IMM output filtering |
-| `"softoltw_no_imm"` | Soft on-line time warping without Kalman path inference or IMM filtering |
-| `"hierarchical_soft_oltw"` | Hierarchical soft on-line time warping with directed measure graph beam search |
+| `"softoltw"` | Soft online time warping with an IMM for each alignment candidate |
+| `"hierarchical_soft_oltw"` | Local IMM followers over a directed measure graph |
 
-SoftOLTW's frame alignment lives in `matchmaker/dp/oltw_soft.py`, the
-path-conditioned Kalman lattice in `matchmaker/dp/kalman_path.py`, and the
-score-informed IMM in `matchmaker/prob/imm.py`. The hierarchical follower
-composes local SoftOLTW followers for its graph hypotheses. The legacy
-`"oltw_soft"` registration retains output IMM filtering without the Kalman lattice.
+Acoustic DP and streaming are in `matchmaker/dp/oltw_soft.py`, IMM path inference
+in `matchmaker/dp/oltw_imm.py`, and motion models in `matchmaker/prob/imm.py`.
+`softoltw` is the current implementation; historical variants remain in Git history.
+
+| Ablation | Method options |
+|---|---|
+| w/o IMM | `use_imm=False` |
+| w/o softmin | `gamma=0` |
+| w/o noise correlation | `correlated_observation=False` |
+
+Disabling IMM uses acoustic SoftOLTW without constructing any Kalman model.
+Disabling softmin selects one incoming path while retaining IMM model probabilities
+and the default acoustic cost scale. Disabling noise correlation removes the
+colored error state contribution while retaining independent observation noise.
+Motion-model subsets remain available through `imm_modes`.
 
 ### MIDI (`input_type="midi"`)
 

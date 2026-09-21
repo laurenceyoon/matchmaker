@@ -10,13 +10,11 @@ from matchmaker.features.audio import FRAME_RATE
 DEFAULT_OBS_VAR = 5.0
 
 
-class ScoreInformedIMM:
+class IMMMotionModels:
     def __init__(
         self,
         score_part: Any = None,
         ref_frame_to_beat: Optional[NDArray] = None,
-        init_position: float = 0.0,
-        init_tempo: float = 1.0,
         obs_var: float = DEFAULT_OBS_VAR,
         tempo: float = 120.0,
         frame_rate: int = FRAME_RATE,
@@ -24,7 +22,9 @@ class ScoreInformedIMM:
         score_pause_gating: bool = True,
     ):
         if obs_var <= 0 or tempo <= 0 or frame_rate <= 0:
-            raise ValueError("Observation variance, tempo and frame rate must be positive")
+            raise ValueError(
+                "Observation variance, tempo and frame rate must be positive"
+            )
         self.enabled = np.array([mode in modes for mode in ("cv", "ca", "zv")])
         if not self.enabled[:2].any():
             raise ValueError("At least one moving mode is required")
@@ -47,31 +47,45 @@ class ScoreInformedIMM:
         if score_part is not None:
             for measure in score_part.iter_all(pt.score.Measure):
                 if measure.start is not None and measure.end is not None:
-                    duration = float(score_part.beat_map(measure.end.t) - score_part.beat_map(measure.start.t))
+                    duration = float(
+                        score_part.beat_map(measure.end.t)
+                        - score_part.beat_map(measure.start.t)
+                    )
                     if duration > 0:
                         measure_beats.append(duration)
-        self.measure_seconds = self.beat_seconds * (float(np.median(measure_beats)) if measure_beats else 1.0)
+        self.measure_seconds = self.beat_seconds * (
+            float(np.median(measure_beats)) if measure_beats else 1.0
+        )
 
         dt = self.dt
-        self.F = np.array([
-            [[1, dt, 0], [0, 1, 0], [0, 0, 0]],
-            [[1, dt, dt**2 / 2], [0, 1, dt], [0, 0, 1]],
-            [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
-        ], dtype=float)
+        self.F = np.array(
+            [
+                [[1, dt, 0], [0, 1, 0], [0, 0, 0]],
+                [[1, dt, dt**2 / 2], [0, 1, dt], [0, 0, 1]],
+                [[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+            ],
+            dtype=float,
+        )
 
         q_ca = 20 * self.R / self.beat_seconds**5
-        self.Q = np.array([
-            np.zeros((3, 3)),
-            q_ca * np.array([[dt**5 / 20, dt**4 / 8, dt**3 / 6],
-                             [dt**4 / 8, dt**3 / 3, dt**2 / 2],
-                             [dt**3 / 6, dt**2 / 2, dt]]),
-            np.zeros((3, 3)),
-        ])
+        self.Q = np.array(
+            [
+                np.zeros((3, 3)),
+                q_ca
+                * np.array(
+                    [
+                        [dt**5 / 20, dt**4 / 8, dt**3 / 6],
+                        [dt**4 / 8, dt**3 / 3, dt**2 / 2],
+                        [dt**3 / 6, dt**2 / 2, dt],
+                    ]
+                ),
+                np.zeros((3, 3)),
+            ]
+        )
         self.F = np.pad(self.F, ((0, 0), (0, 1), (0, 1)))
         self.Q = np.pad(self.Q, ((0, 0), (0, 1), (0, 1)))
         self.M_play = self._transition_matrix(allow_pause=False)
         self.M_pause = self._transition_matrix(allow_pause=True)
-        self.reset(init_position, init_tempo)
 
     @staticmethod
     def _score_pause_ranges(score_part: Any) -> list:
@@ -80,15 +94,23 @@ class ScoreInformedIMM:
         ranges = []
         for fermata in score_part.iter_all(pt.score.Fermata):
             ref = fermata.ref
-            if getattr(ref, "start", None) is not None and getattr(ref, "end", None) is not None:
-                ranges.append((float(score_part.beat_map(ref.start.t)),
-                               float(score_part.beat_map(ref.end.t))))
+            if (
+                getattr(ref, "start", None) is not None
+                and getattr(ref, "end", None) is not None
+            ):
+                ranges.append(
+                    (
+                        float(score_part.beat_map(ref.start.t)),
+                        float(score_part.beat_map(ref.end.t)),
+                    )
+                )
 
         notes = score_part.note_array()
         if len(notes):
-            intervals = sorted((float(n["onset_beat"]),
-                                float(n["onset_beat"] + n["duration_beat"]))
-                               for n in notes)
+            intervals = sorted(
+                (float(n["onset_beat"]), float(n["onset_beat"] + n["duration_beat"]))
+                for n in notes
+            )
             end = intervals[0][1]
             for start, stop in intervals[1:]:
                 if start > end:
@@ -99,7 +121,9 @@ class ScoreInformedIMM:
     def _transition_matrix(self, allow_pause: bool) -> np.ndarray:
         active = np.flatnonzero(self.enabled & np.array([True, True, allow_pause]))
         n = len(active)
-        durations = np.array([self.measure_seconds, self.beat_seconds, self.beat_seconds])[active]
+        durations = np.array(
+            [self.measure_seconds, self.beat_seconds, self.beat_seconds]
+        )[active]
         matrix = np.zeros((3, 3))
         matrix[:, active] = 1 / n
         if n > 1:
@@ -108,111 +132,62 @@ class ScoreInformedIMM:
             matrix[np.ix_(active, active)] = expm(generator * self.dt)
         return matrix
 
-    def _combine(self, probabilities: np.ndarray) -> None:
-        self.state = probabilities @ self.states
-        residuals = self.states - self.state
-        self.P = np.einsum("i,ijk->jk", probabilities, self.P_matrices)
-        self.P += np.einsum("i,ij,ik->jk", probabilities, residuals, residuals)
+    def initial_state(self, position=0.0):
+        velocity = 1.0 / self.dt
+        probabilities = np.zeros(3)
+        probabilities[np.flatnonzero(self.enabled[:2])[0]] = 1.0
+        states = np.array(
+            [
+                [position, velocity, 0.0, 0.0],
+                [position, velocity, 0.0, 0.0],
+                [position, 0.0, 0.0, 0.0],
+            ]
+        )
+        covariances = np.array(
+            [
+                np.diag([self.R, velocity**2, 0, 0]),
+                np.diag([self.R, velocity**2, (velocity / self.beat_seconds) ** 2, 0]),
+                np.diag([self.R, 0, 0, 0]),
+            ]
+        )
+        return states, covariances, probabilities
 
-    @property
-    def position(self) -> float:
-        return float(self.state[0])
-
-    @property
-    def tempo(self) -> float:
-        """Reference frames per input frame, matching the SoftOLTW interface."""
-        return float(self.state[1] * self.dt)
-
-    @property
-    def position_uncertainty(self) -> float:
-        return float(np.sqrt(max(self.P[0, 0], 0.0)))
-
-    @property
-    def mode_probabilities(self) -> Tuple[float, float, float]:
-        return tuple(float(p) for p in self.mu)
-
-    def reset(self, position: float = 0.0, tempo: float = 1.0) -> None:
-        velocity = tempo / self.dt
-
-        self.mu = np.zeros(3)
-        self.mu[np.flatnonzero(self.enabled[:2])[0]] = 1.0
-        self.c_bar = self.mu.copy()
-        self.states = np.array([[position, velocity, 0.0],
-                                [position, velocity, 0.0], [position, 0.0, 0.0]])
-
-        self.P_matrices = np.array([
-            np.diag([self.R, velocity**2, 0]),
-            np.diag([self.R, velocity**2, (velocity / self.beat_seconds)**2]),
-            np.diag([self.R, 0, 0]),
-        ])
-        self.states = np.pad(self.states, ((0, 0), (0, 1)))
-        self.P_matrices = np.pad(self.P_matrices, ((0, 0), (0, 1), (0, 1)))
-        self.mu_history = [self.mode_probabilities]
-        self._combine(self.mu)
-
-    def set_observation_error(self, variance: float, initialize: bool = False) -> None:
-        duration_frames = np.sqrt(12 * variance)
-        correlation = np.exp(-1 / duration_frames) if duration_frames > 0 else 0.0
-        self.F[:, 3, 3] = correlation
-        self.Q[:, 3, 3] = variance * (1 - correlation**2)
-        if initialize:
-            self.P_matrices[:, 3, 3] = variance
-
-    def predict(self, is_silent: Optional[bool] = None) -> np.ndarray:
-        beat = self.position
-        if self.r2b is not None and len(self.r2b):
-            beat = float(np.interp(self.position, np.arange(len(self.r2b)), self.r2b))
-        allow_pause = not self.score_pause_gating or any(start <= beat < end for start, end in self.pause_ranges)
-
-        if self.score_part is None and is_silent is True:
-            allow_pause = True
-        transition = self.M_pause if allow_pause else self.M_play
-
-        self.c_bar = self.mu @ transition
+    def predict(self, probabilities, states, covariance, score_variance):
+        means = np.einsum("am,amd->ad", probabilities, states)
+        beats = means[:, 0]
+        if self.r2b is not None:
+            beats = np.interp(beats, np.arange(len(self.r2b)), self.r2b)
+        allowed = np.full(len(states), not self.score_pause_gating)
+        for start, end in self.pause_ranges:
+            allowed |= (beats >= start) & (beats < end)
+        transition = np.where(allowed[:, None, None], self.M_pause, self.M_play)
+        joint = probabilities[:, :, None] * transition
+        priors = joint.sum(axis=1)
         mixing = np.divide(
-            self.mu[:, None] * transition, self.c_bar[None, :],
-            out=np.zeros_like(transition), where=self.c_bar[None, :] > 0,
+            joint,
+            priors[:, None, :],
+            out=np.zeros_like(joint),
+            where=priors[:, None, :] > 0,
         )
-        for j in np.flatnonzero(self.c_bar == 0):
-            mixing[j, j] = 1.0
-        mixed_states = mixing.T @ self.states
-        residuals = self.states[:, None, :] - mixed_states[None, :, :]
-        mixed_covariances = np.einsum("ij,ikl->jkl", mixing, self.P_matrices)
-        mixed_covariances += np.einsum("ij,ijk,ijl->jkl", mixing, residuals, residuals)
-
-        self.states = np.einsum("ijk,ik->ij", self.F, mixed_states)
-        self.P_matrices = self.F @ mixed_covariances @ self.F.transpose(0, 2, 1) + self.Q
-        self._combine(self.c_bar)
-        return self.state.copy()
-
-    def update(self, z: Optional[float], obs_var: Optional[float] = None) -> np.ndarray:
-        if z is None:
-            self.mu = self.c_bar.copy()
-            self.mu_history.append(self.mode_probabilities)
-            return self.state.copy()
-        observation_variance = self.R if obs_var is None else float(obs_var)
-        innovations = float(z) - self.states @ self.H
-        cross_covariances = self.P_matrices @ self.H
-        variances = cross_covariances @ self.H + observation_variance
-        gains = cross_covariances / variances[:, None]
-        self.states += gains * innovations[:, None]
-        residual = np.eye(len(self.H))[None, :, :] - gains[:, :, None] * self.H
-        self.P_matrices = (
-            residual @ self.P_matrices @ residual.transpose(0, 2, 1)
-            + observation_variance * gains[:, :, None] * gains[:, None, :]
+        mixed = np.einsum("aij,aid->ajd", mixing, states)
+        residuals = states[:, :, None, :] - mixed[:, None, :, :]
+        covariance = np.einsum("aij,aikl->ajkl", mixing, covariance)
+        covariance += np.einsum("aij,aijk,aijl->ajkl", mixing, residuals, residuals)
+        frames = np.clip(np.rint(means[:, 0]).astype(int), 0, len(score_variance) - 1)
+        variance = score_variance[frames]
+        duration = np.sqrt(12 * variance)
+        correlation = np.exp(
+            np.divide(
+                -1.0, duration, out=np.full_like(duration, -np.inf), where=duration > 0
+            )
         )
-        log_weights = np.full(3, -np.inf)
-        active = self.c_bar > 0
-        log_weights[active] = np.log(self.c_bar[active]) - 0.5 * (
-            np.log(2 * np.pi * variances[active])
-            + innovations[active]**2 / variances[active]
-        )
-        weights = np.exp(log_weights - np.max(log_weights))
-        self.mu = weights / weights.sum()
-
-        self._combine(self.mu)
-        self.mu_history.append(self.mode_probabilities)
-        return self.state.copy()
+        dynamics = np.tile(self.F, (len(states), 1, 1, 1))
+        noise = np.tile(self.Q, (len(states), 1, 1, 1))
+        dynamics[:, :, 3, 3] = correlation[:, None]
+        noise[:, :, 3, 3] = (variance * (1 - correlation**2))[:, None]
+        predicted = np.einsum("amij,amj->ami", dynamics, mixed)
+        covariance = dynamics @ covariance @ dynamics.swapaxes(-1, -2) + noise
+        return priors, predicted, covariance
 
 
 def score_position_variance(score_part, ref_frame_to_beat, n_frames):
@@ -244,5 +219,5 @@ def score_position_variance(score_part, ref_frame_to_beat, n_frames):
     for start, end in spans:
         left, right = np.searchsorted(beats, [start, end])
         start_frame, end_frame = np.interp([start, end], beats, frames)
-        variance[left:right] = (end_frame - start_frame)**2 / 12
+        variance[left:right] = (end_frame - start_frame) ** 2 / 12
     return variance

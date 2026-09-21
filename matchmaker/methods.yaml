@@ -212,33 +212,7 @@ methods:
         window_size: 10
         frame_rate: 50
 
-    oltw_soft:
-      class: matchmaker.dp:SoftOnlineTimeWarping
-      reference: score_audio
-      args:
-        <<: *oltw_frame_args
-        score_part: {from: score_part}
-        tempo: {from: tempo}
-      config_passthrough: true
-      default_kwargs:
-        window_size: 10
-        step_size: 3
-
     softoltw:
-      class: matchmaker.dp:SoftOnlineTimeWarping
-      reference: score_audio
-      args:
-        <<: *oltw_frame_args
-        score_part: {from: score_part}
-        tempo: {from: tempo}
-      config_passthrough: true
-      default_kwargs:
-        window_size: 10
-        step_size: 3
-        use_imm: true
-        path_tempo: true
-
-    joint_imm:
       class: matchmaker.dp.oltw_imm:IMMOnlineTimeWarping
       reference: score_audio
       args:
@@ -249,19 +223,6 @@ methods:
       default_kwargs:
         window_size: 10
         step_size: 3
-
-    softoltw_no_imm:
-      class: matchmaker.dp:SoftOnlineTimeWarping
-      reference: score_audio
-      args:
-        <<: *oltw_frame_args
-        score_part: {from: score_part}
-        tempo: {from: tempo}
-      config_passthrough: true
-      default_kwargs:
-        window_size: 10
-        step_size: 3
-        use_imm: false
 
     hierarchical_soft_oltw:
       class: matchmaker.dp:HierarchicalSoftOnlineTimeWarping

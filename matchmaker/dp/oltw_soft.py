@@ -6,8 +6,6 @@ import numpy as np
 from numpy.typing import NDArray
 
 from matchmaker.base import OnlineAlignment
-from matchmaker.dp.kalman_path import KalmanPathLattice
-from matchmaker.prob.imm import DEFAULT_OBS_VAR, ScoreInformedIMM, score_position_variance
 from matchmaker.features.audio import FRAME_RATE
 from matchmaker.io.audio import QUEUE_TIMEOUT
 from matchmaker.io.queue import RECVQueue
@@ -90,6 +88,29 @@ def weighted_soft_oltw_loop(
     return global_cost_matrix, min_index, min_costs
 
 
+class SoftWarpingPath:
+    def __init__(self, size):
+        self.size = size
+
+    def reset(self, position=0):
+        self.costs = np.full((self.size + 1, 2), np.inf)
+        self.index = position
+
+    def step(self, distances, start, gamma, input_index, horizontal_weight):
+        self.costs, self.index, cost = weighted_soft_oltw_loop(
+            self.costs,
+            distances,
+            start,
+            start + len(distances),
+            input_index,
+            np.inf,
+            self.index,
+            gamma,
+            w_horizontal=horizontal_weight,
+        )
+        return self.index, cost
+
+
 class SoftOnlineTimeWarping(OnlineAlignment):
     DEFAULT_DISTANCE_FUNC: str = "Manhattan"
 
@@ -101,15 +122,10 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         step_size: int = 3,
         gamma: float = DEFAULT_GAMMA,
         w_horizontal: float = DEFAULT_W_HORIZONTAL,
-        obs_var: float = DEFAULT_OBS_VAR,
-        use_imm: bool = True,
-        path_tempo: bool = False,
-        imm_modes: Tuple[str, ...] = ("cv", "ca", "zv"),
-        correlated_observation: bool = True,
-        filter_output: bool = True,
-        score_pause_gating: bool = True,
         score_part: Any = None,
-        distance_func: Union[str, Callable, Tuple[str, Dict[str, Any]]] = DEFAULT_DISTANCE_FUNC,
+        distance_func: Union[
+            str, Callable, Tuple[str, Dict[str, Any]]
+        ] = DEFAULT_DISTANCE_FUNC,
         start_window_size: Union[float, int] = 0.1,
         frame_rate: int = FRAME_RATE,
         ref_frame_to_beat: Optional[NDArray] = None,
@@ -118,7 +134,6 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         tempo_lookback_sec: float = DEFAULT_TEMPO_LOOKBACK_SEC,
         velocity_scale: float = DEFAULT_VELOCITY_SCALE,
         min_history_sec: float = DEFAULT_MIN_HISTORY_SEC,
-        **kwargs,
     ) -> None:
         if ref_frame_to_beat is None and score_positions is not None:
             ref_frame_to_beat = score_positions
@@ -136,8 +151,12 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         self.tempo_lookback_sec = float(tempo_lookback_sec)
         self.velocity_scale = float(velocity_scale)
         self.min_history_sec = float(min_history_sec)
-        self._lookback_frames = max(1, int(np.round(self.tempo_lookback_sec * self.frame_rate)))
-        self._min_history_frames = max(2, int(np.round(self.min_history_sec * self.frame_rate)))
+        self._lookback_frames = max(
+            1, int(np.round(self.tempo_lookback_sec * self.frame_rate))
+        )
+        self._min_history_frames = max(
+            2, int(np.round(self.min_history_sec * self.frame_rate))
+        )
         self._ref_frame_to_beat = ref_frame_to_beat
         self.step_size = step_size
         self._window_size = int(np.round(window_size * self.frame_rate))
@@ -153,31 +172,14 @@ class SoftOnlineTimeWarping(OnlineAlignment):
 
         self.gamma = gamma
         self.w_horizontal = w_horizontal
-        self._obs_var = obs_var
-        self.use_imm = use_imm
-        self.filter_output = filter_output
-        self.path_tempo = use_imm and path_tempo
         self.score_part = score_part
-
-        if self.use_imm:
-            self._score_position_variance = score_position_variance(
-                self.score_part if correlated_observation else None, self._ref_frame_to_beat, self.N_ref,
-            )
-            self.kalman = ScoreInformedIMM(
-                score_part=self.score_part,
-                ref_frame_to_beat=self._ref_frame_to_beat,
-                obs_var=self._obs_var,
-                tempo=self.tempo,
-                frame_rate=self.frame_rate,
-                modes=imm_modes,
-                score_pause_gating=score_pause_gating,
-            )
-        else:
-            self.kalman = None
+        self.path = self._create_path()
 
         self.reset()
 
-    def _init_distance_func(self, distance_func: Union[str, Callable, Tuple[str, Dict[str, Any]]]) -> None:
+    def _init_distance_func(
+        self, distance_func: Union[str, Callable, Tuple[str, Dict[str, Any]]]
+    ) -> None:
         if not (isinstance(distance_func, (str, tuple)) or callable(distance_func)):
             raise MatchmakerInvalidParameterTypeError(
                 parameter_name="distance_func",
@@ -200,31 +202,29 @@ class SoftOnlineTimeWarping(OnlineAlignment):
                     valid_options=CYTHONIZED_METRICS_W_ARGUMENTS,
                     value=distance_func[0],
                 )
-            self.distance_func = getattr(distances, distance_func[0])(**distance_func[1])
+            self.distance_func = getattr(distances, distance_func[0])(
+                **distance_func[1]
+            )
         elif callable(distance_func):
             self.distance_func = distance_func
 
         if isinstance(self.distance_func, Metric):
             self.vdist = vdist
         else:
-            self.vdist = lambda X, y, lcf: np.array([lcf(x, y) for x in X]).astype(np.float32)
+            self.vdist = lambda X, y, lcf: np.array([lcf(x, y) for x in X]).astype(
+                np.float32
+            )
 
-    def reset(self) -> None:
-        self.current_index = 0
-        self._current_frame = 0
+    def _create_path(self):
+        return SoftWarpingPath(self.N_ref)
+
+    def reset(self, position=0) -> None:
+        self.current_index = self._frame_to_score_idx(position)
+        self._current_frame = position
         self.input_index = 0
-        self.input_features: list = []
+        self.input_features = []
         self._alignment_path = []
-        self.global_cost_matrix = (
-            None if self.path_tempo else np.full((self.N_ref + 1, 2), np.inf)
-        )
-        if self.kalman is not None:
-            self.kalman.reset()
-        self.path_lattice = (
-            KalmanPathLattice(self.N_ref, self._obs_var,
-                             self.kalman.beat_seconds * self.frame_rate, self.step_size)
-            if self.path_tempo else None
-        )
+        self.path.reset(position)
         self._pos_history = []
         self._music_started = False
 
@@ -244,8 +244,7 @@ class SoftOnlineTimeWarping(OnlineAlignment):
             return float(self._ref_frame_to_beat[-1])
         r = f_clamped - i
         return float(
-            (1.0 - r) * self._ref_frame_to_beat[i]
-            + r * self._ref_frame_to_beat[i + 1]
+            (1.0 - r) * self._ref_frame_to_beat[i] + r * self._ref_frame_to_beat[i + 1]
         )
 
     def _frame_to_score_idx(self, frame: int) -> int:
@@ -256,8 +255,6 @@ class SoftOnlineTimeWarping(OnlineAlignment):
         return max(0, min(idx, len(self.score_positions) - 1))
 
     def get_current_position(self) -> float:
-        if self.kalman is not None and self.filter_output:
-            return self._frame_to_beat(self.kalman.position)
         return self._frame_to_beat(self._current_frame)
 
     def get_window(self) -> Tuple[int, int]:
@@ -294,14 +291,6 @@ class SoftOnlineTimeWarping(OnlineAlignment):
                 return
             self._music_started = True
 
-        if self.kalman is not None:
-            frame = int(np.clip(round(self.kalman.position), 0, self.N_ref - 1))
-            variance = self._score_position_variance[frame]
-            self.kalman.set_observation_error(variance, initialize=self.input_index == 0)
-            if self.input_index > 0:
-                self.kalman.predict()
-
-        min_index = max(self.window_index - self.step_size, 0)
         window_start, window_end = self.get_window()
         window_cost = self.vdist(
             self.reference_features[window_start:window_end],
@@ -320,23 +309,9 @@ class SoftOnlineTimeWarping(OnlineAlignment):
             excess_tempo, 0.0, 1.0
         )
 
-        if self.path_lattice is not None:
-            min_index, _ = self.path_lattice.step(
-                window_cost, window_start, self.gamma or DEFAULT_GAMMA, self.input_index, horizontal_weight,
-                hard_min=self.gamma == 0,
-            )
-        else:
-            self.global_cost_matrix, min_index, _ = weighted_soft_oltw_loop(
-                global_cost_matrix=self.global_cost_matrix,
-                window_cost=window_cost,
-                window_start=window_start,
-                window_end=window_end,
-                input_index=self.input_index,
-                min_costs=np.inf,
-                min_index=min_index,
-                gamma=self.gamma,
-                w_horizontal=horizontal_weight,
-            )
+        min_index, _ = self.path.step(
+            window_cost, window_start, self.gamma, self.input_index, horizontal_weight
+        )
         if self.input_index > 0:
             self._current_frame = min(
                 max(self._current_frame, min_index),
@@ -344,8 +319,5 @@ class SoftOnlineTimeWarping(OnlineAlignment):
             )
         self.current_index = self._frame_to_score_idx(self._current_frame)
         self._pos_history.append(self._current_frame)
-
-        if self.kalman is not None:
-            self.kalman.update(float(self._current_frame))
 
         self.input_index += 1

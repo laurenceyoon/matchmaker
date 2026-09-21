@@ -1,7 +1,11 @@
 import numpy as np
 
-from matchmaker.dp.oltw_soft import SoftOnlineTimeWarping
-from matchmaker.prob.imm import ScoreInformedIMM, score_position_variance
+from matchmaker.dp.oltw_soft import DEFAULT_GAMMA, SoftOnlineTimeWarping
+from matchmaker.prob.imm import (
+    DEFAULT_OBS_VAR,
+    IMMMotionModels,
+    score_position_variance,
+)
 
 
 class IMMPathFilter:
@@ -11,68 +15,44 @@ class IMMPathFilter:
         self.steps = np.arange(max_step + 1)
         self.reset()
 
-    def reset(self):
-        self.model.reset()
+    def reset(self, position=0):
+        states, covariances, probabilities = self.model.initial_state(position)
+        self.index = position
         size = len(self.variance)
         self.costs = np.full(size, np.inf)
-        self.costs[0] = 0.0
-        self.states = np.tile(self.model.states, (size, 1, 1))
-        self.covariances = np.tile(self.model.P_matrices, (size, 1, 1, 1))
+        self.costs[position] = 0.0
+        self.states = np.tile(states, (size, 1, 1))
+        self.covariances = np.tile(covariances, (size, 1, 1, 1))
         self.covariances[:, :, 3, 3] = self.variance[:, None]
-        self.probabilities = np.tile(self.model.mu, (size, 1))
-        self.state = self.model.state.copy()
+        self.probabilities = np.tile(probabilities, (size, 1))
+        self.state = probabilities @ states
 
     @property
     def position(self):
         return float(self.state[0])
 
     def predict(self, indices):
-        probabilities = self.probabilities[indices]
-        states, covariance = self.states[indices], self.covariances[indices]
-        means = np.einsum("am,amd->ad", probabilities, states)
-        beats = means[:, 0]
-        if self.model.r2b is not None:
-            beats = np.interp(beats, np.arange(len(self.model.r2b)), self.model.r2b)
-        allowed = np.full(len(indices), not self.model.score_pause_gating)
-        for start, end in self.model.pause_ranges:
-            allowed |= (beats >= start) & (beats < end)
-        transition = np.where(
-            allowed[:, None, None], self.model.M_pause, self.model.M_play
+        return self.model.predict(
+            self.probabilities[indices],
+            self.states[indices],
+            self.covariances[indices],
+            self.variance,
         )
-        joint = probabilities[:, :, None] * transition
-        priors = joint.sum(axis=1)
-        mixing = np.divide(
-            joint,
-            priors[:, None, :],
-            out=np.zeros_like(joint),
-            where=priors[:, None, :] > 0,
-        )
-        mixed = np.einsum("aij,aid->ajd", mixing, states)
-        residuals = states[:, :, None, :] - mixed[:, None, :, :]
-        covariance = np.einsum("aij,aikl->ajkl", mixing, covariance)
-        covariance += np.einsum("aij,aijk,aijl->ajkl", mixing, residuals, residuals)
-        frames = np.clip(np.rint(means[:, 0]).astype(int), 0, len(self.variance) - 1)
-        variance = self.variance[frames]
-        duration = np.sqrt(12 * variance)
-        correlation = np.exp(
-            np.divide(
-                -1.0, duration, out=np.full_like(duration, -np.inf), where=duration > 0
-            )
-        )
-        dynamics = np.tile(self.model.F, (len(indices), 1, 1, 1))
-        noise = np.tile(self.model.Q, (len(indices), 1, 1, 1))
-        dynamics[:, :, 3, 3] = correlation[:, None]
-        noise[:, :, 3, 3] = (variance * (1 - correlation**2))[:, None]
-        predicted = np.einsum("amij,amj->ami", dynamics, mixed)
-        covariance = dynamics @ covariance @ dynamics.swapaxes(-1, -2) + noise
-        return priors, predicted, covariance
 
-    def step(
-        self, distances, start, gamma, input_index, horizontal_weight, hard_min=False
-    ):
+    def restart_from(self, source, position):
+        self.reset(position)
+        self.states[position] = source.states[source.index]
+        self.states[position, :, 0] = position
+        self.covariances[position] = source.covariances[source.index]
+        self.probabilities[position] = source.probabilities[source.index]
+        self.state = self.probabilities[position] @ self.states[position]
+
+    def step(self, distances, start, gamma, input_index, horizontal_weight):
+        hard_min = gamma == 0
+        gamma = gamma or DEFAULT_GAMMA
         if input_index == 0:
-            self.costs[0] = float(np.sum(distances)) / gamma
-            return 0, float(distances[0])
+            self.costs[self.index] = float(np.sum(distances)) / gamma
+            return self.index, float(distances[self.index - start])
         positions = np.arange(start, start + len(distances))
         ancestors = positions[:, None] - self.steps
         valid = ancestors >= start
@@ -133,45 +113,48 @@ class IMMPathFilter:
         self.covariances[positions] = covariance
         self.probabilities[positions] = probabilities
         self.state = probabilities[winner] @ means[winner]
-        return int(positions[winner]), float(gamma * normalized[winner])
+        self.index = int(positions[winner])
+        return self.index, float(gamma * normalized[winner])
 
 
 class IMMOnlineTimeWarping(SoftOnlineTimeWarping):
     def __init__(
         self,
         *args,
+        use_imm=True,
         imm_modes=("cv", "ca", "zv"),
         score_pause_gating=True,
         correlated_observation=True,
+        obs_var=DEFAULT_OBS_VAR,
         **kwargs,
     ):
-        self.path_filter = None
-        super().__init__(
-            *args, use_imm=False, path_tempo=False, filter_output=False, **kwargs
-        )
-        model = ScoreInformedIMM(
+        self.use_imm = use_imm
+        self.imm_modes = imm_modes
+        self.score_pause_gating = score_pause_gating
+        self.correlated_observation = correlated_observation
+        self.obs_var = obs_var
+        super().__init__(*args, **kwargs)
+
+    def _create_path(self):
+        if not self.use_imm:
+            return super()._create_path()
+        model = IMMMotionModels(
             score_part=self.score_part,
             ref_frame_to_beat=self._ref_frame_to_beat,
-            obs_var=self._obs_var,
+            obs_var=self.obs_var,
             tempo=self.tempo,
             frame_rate=self.frame_rate,
-            modes=imm_modes,
-            score_pause_gating=score_pause_gating,
+            modes=self.imm_modes,
+            score_pause_gating=self.score_pause_gating,
         )
         variance = score_position_variance(
-            self.score_part if correlated_observation else None,
+            self.score_part if self.correlated_observation else None,
             self._ref_frame_to_beat,
             self.N_ref,
         )
-        self.path_filter = IMMPathFilter(model, variance, self.step_size)
-        self.reset()
-
-    def reset(self):
-        super().reset()
-        if self.path_filter is not None:
-            self.path_filter.reset()
-            self.path_lattice = self.path_filter
-            self.global_cost_matrix = None
+        return IMMPathFilter(model, variance, self.step_size)
 
     def get_current_position(self):
-        return self._frame_to_beat(self.path_filter.position)
+        if self.use_imm:
+            return self._frame_to_beat(self.path.position)
+        return super().get_current_position()
