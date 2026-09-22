@@ -197,6 +197,11 @@ def test_filtered_position_cannot_close_repeat_before_alignment(repeated_section
     parent.follower.path.index = 30
     follower._advance_node(parent)
 
+    assert parent.node_id == "1"
+
+    parent.follower._current_frame = 30
+    follower._advance_node(parent)
+
     assert parent.node_id == "2"
 
 

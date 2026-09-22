@@ -22,6 +22,10 @@ from matchmaker.io.audio import QUEUE_TIMEOUT
 from matchmaker.io.queue import RECVQueue
 from matchmaker.utils.misc import set_latency_stats
 
+# Lattice costs are erased only this many measures behind the current node, so
+# a transient forward excursion of the argmin cannot lock the follower ahead.
+LATTICE_MARGIN_MEASURES = 3
+
 
 def logsumexp(values: list[float]) -> float:
     if not values:
@@ -91,6 +95,7 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
 
         ordered_nodes = sorted(score_graph.nodes.values(), key=lambda n: n.score_beat)
         self.ordered_nodes = ordered_nodes
+        self.node_order = {node.node_id: idx for idx, node in enumerate(ordered_nodes)}
         self.node_end_beats: Dict[str, float] = {}
         for idx, node in enumerate(ordered_nodes):
             dur = float(node.metadata.get("duration_beats", 0.0))
@@ -155,7 +160,7 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
     def _advance_node(self, hypothesis: GraphHypothesis) -> None:
         node_id = hypothesis.node_id
         current_start = self.score_graph.nodes[node_id].score_beat
-        aligned_beat = self.ref_frame_to_beat[hypothesis.follower.path.index]
+        aligned_beat = self.ref_frame_to_beat[hypothesis.follower.window_index]
         for node in self.ordered_nodes:
             if current_start < node.score_beat <= aligned_beat:
                 node_id = node.node_id
@@ -193,7 +198,10 @@ class HierarchicalSoftOnlineTimeWarping(OnlineAlignment):
             candidates.extend(self._expand(hypothesis) if audible else [hypothesis])
         for hypothesis in candidates:
             follower = hypothesis.follower
-            follower.path.costs[:self.node_start_frames[hypothesis.node_id]] = np.inf
+            margin_node = self.ordered_nodes[
+                max(0, self.node_order[hypothesis.node_id] - LATTICE_MARGIN_MEASURES)
+            ]
+            follower.path.costs[:self.node_start_frames[margin_node.node_id]] = np.inf
             follower.step(features)
             hypothesis.last_score_beat = follower.get_current_position()
             if audible and follower._music_started:

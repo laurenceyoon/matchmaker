@@ -22,6 +22,7 @@ DEFAULT_W_HORIZONTAL: float = 10.0
 DEFAULT_TEMPO_LOOKBACK_SEC: float = 1.0
 DEFAULT_VELOCITY_SCALE: float = 0.35
 DEFAULT_MIN_HISTORY_SEC: float = 0.33
+SILENCE_PEAKINESS: float = 2.0
 
 
 @numba.extending.register_jitable
@@ -299,7 +300,7 @@ class SoftOnlineTimeWarping(OnlineAlignment):
 
         feat_abs = np.abs(feat)
         peakiness = float(np.max(feat_abs)) / (float(np.mean(feat_abs)) + 1e-10)
-        is_silent = peakiness < 2.0
+        is_silent = peakiness < SILENCE_PEAKINESS
         if not self._music_started:
             if is_silent:
                 self._pos_history.append(self._current_frame)

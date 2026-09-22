@@ -267,6 +267,17 @@ methods:
         hop_length: 128
         n_fft: 512
 
+    skf_imm:
+      class: matchmaker.prob.skf_imm:IMMSwitchingKalmanFollower
+      reference: score_audio
+      args:
+        <<: *oltw_frame_args
+        note_array: {from: note_array}
+        score_graph: {from: score_graph}
+        score_part: {from: score_part}
+        tempo: {from: tempo}
+      config_passthrough: true
+
     raphael_ssm:
       class: matchmaker.prob.skf:SwitchingKalmanFilterFollower
       args:
