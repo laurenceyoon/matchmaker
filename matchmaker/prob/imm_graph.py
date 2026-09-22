@@ -56,7 +56,7 @@ class IMMGraphFollower(OnlineAlignment):
         sigma_eta_scale: float = SIGMA_ETA_SCALE,
         tempo_prior: float = TEMPO_PRIOR,
         modes: Tuple[str, ...] = ("cv", "ca", "zv"),
-        position_estimator: str = "map",
+        position_estimator: str = "mean",
         duration_model: str = "legacy",
         emission_model: str = "frame",
         **kwargs,
@@ -324,6 +324,7 @@ class IMMGraphFollower(OnlineAlignment):
             self._position, route = estimate_chord_position(
                 self.onset_beats, self.lengths, self.k, self.a, self.r,
                 self.p, self.w, self.x[:, :, 0], self.delta,
+                hold_mode=ZV if self.motion.enabled[ZV] else None,
             )
             self.current_route = self.routes[route]
             self.current_index = int(np.clip(

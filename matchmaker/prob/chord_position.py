@@ -13,6 +13,7 @@ def estimate_chord_position(
     mode_probabilities,
     tempos,
     frame_seconds,
+    hold_mode=None,
 ):
     """Return ``(position_in_beats, route_id)`` without changing the filter.
 
@@ -24,6 +25,11 @@ def estimate_chord_position(
     Ages count emitted frames, so age one is the chord onset. Tempo is seconds
     per whole note and ``lengths`` are whole notes; ``onset_beats`` can use any
     score beat unit. This readout is causal and carries no smoothing state.
+
+    ``hold_mode``, if given, is the column of a mode (e.g. ZV) that holds the
+    chord rather than progressing through it by tempo; its elapsed-age can grow
+    arbitrarily large while sustained, so its progress fraction is fixed at 0
+    (the chord's onset) instead of being read off elapsed time over duration.
     """
     route_ids, inverse = np.unique(routes, return_inverse=True)
     route_mass = np.bincount(inverse, weights=probabilities)
@@ -34,6 +40,8 @@ def estimate_chord_position(
     duration = lengths[k, None] * tempos[selected]
     elapsed = (ages[selected] - 1)[:, None] * frame_seconds
     fraction = np.clip(elapsed / np.maximum(duration, np.finfo(float).tiny), 0, 1)
+    if hold_mode is not None:
+        fraction[:, hold_mode] = 0.0
     positions = onset_beats[k, None] + fraction * (
         onset_beats[next_k] - onset_beats[k]
     )[:, None]

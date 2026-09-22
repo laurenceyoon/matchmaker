@@ -128,8 +128,12 @@ class IMMMotionModels:
     def _transition_matrix(self, allow_pause: bool) -> np.ndarray:
         active = np.flatnonzero(self.enabled & np.array([True, True, allow_pause]))
         n = len(active)
+        # A tempo drift (CA) is a phrase-scale gesture, like the steady pulse it
+        # perturbs (CV), not an instantaneous event like a pause (ZV): both share
+        # the measure-scale residence time, so a rubato gesture has room to
+        # accumulate before mixing reverts it to the steady-pulse mode.
         durations = np.array(
-            [self.measure_seconds, self.beat_seconds, self.beat_seconds]
+            [self.measure_seconds, self.measure_seconds, self.beat_seconds]
         )[active]
         matrix = np.zeros((3, 3))
         matrix[:, active] = 1 / n
