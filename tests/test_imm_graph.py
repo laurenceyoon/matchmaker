@@ -4,7 +4,7 @@ import pytest
 
 from matchmaker import EXAMPLE_PIECES, Matchmaker
 from matchmaker.graph.score_graph import ScoreDirectedGraphBuilder
-from matchmaker.prob.skf_imm import ZV, IMMSwitchingKalmanFollower
+from matchmaker.prob.imm_graph import ZV, IMMGraphFollower
 
 FRAME_RATE = 30
 FRAMES_PER_CHORD = 15  # one-beat chords at 120 bpm
@@ -32,7 +32,7 @@ def _follower(part, **kwargs):
     for k, pitch in enumerate(_chord_pitches(note_array)):
         chroma[k * FRAMES_PER_CHORD:(k + 1) * FRAMES_PER_CHORD, pitch % 12] = 1.0
     beats = np.repeat(onsets, FRAMES_PER_CHORD) + np.tile(np.arange(FRAMES_PER_CHORD) / FRAMES_PER_CHORD, len(onsets))
-    return IMMSwitchingKalmanFollower(
+    return IMMGraphFollower(
         reference_features=chroma, score_positions=onsets, frame_rate=FRAME_RATE,
         ref_frame_to_beat=beats, note_array=note_array,
         score_graph=ScoreDirectedGraphBuilder().build(part), score_part=part, **kwargs,
@@ -56,7 +56,7 @@ def test_chord_jumps_map_repeat_to_first_chord_of_target():
 
 def test_repeat_jump_splits_advance_by_graph_prior(monkeypatch):
     follower = _follower(_repeat_part(), modes=("cv",))
-    monkeypatch.setattr(follower, "_log_likelihoods", lambda features: np.zeros(follower.K + 1))
+    monkeypatch.setattr(follower, "_log_frame_likelihoods", lambda features: np.zeros(len(follower.log_reference) + 1))
     follower.k[:] = 7
     follower.a[:] = 10_000
     follower.step(_chroma(0))
@@ -107,7 +107,7 @@ def test_held_chord_stays_while_its_sound_continues():
 def test_example_piece_runs_to_the_end_without_backward_jumps():
     piece = EXAMPLE_PIECES["simple_mozart"]
     mm = Matchmaker(score_file=piece["score"], performance_file=piece["audio"],
-                    input_type="audio", method="skf_imm", wait=False)
+                    input_type="audio", method="imm_graph", wait=False)
     for _ in mm.run(verbose=False):
         pass
     path = mm.score_follower.alignment_path

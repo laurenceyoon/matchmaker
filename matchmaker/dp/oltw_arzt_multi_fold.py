@@ -127,6 +127,10 @@ class OnlineTimeWarpingArztMultiFold(OnlineTimeWarpingArztFrame):
             else np.zeros(max(1, len(ref_feat)), dtype=np.float32)
         )
 
+        # Build parallel track hypotheses from the score repeat structure
+        # before the parent __init__ so that reset() always finds them.
+        self._build_hypotheses()
+
         super().__init__(
             reference_features=ref_feat,
             score_positions=notated_positions,
@@ -139,9 +143,6 @@ class OnlineTimeWarpingArztMultiFold(OnlineTimeWarpingArztFrame):
             queue=queue,
             **kwargs,
         )
-
-        # Build parallel track hypotheses from score repeat structure
-        self._build_hypotheses()
         self.reset()
 
     def _build_hypotheses(self) -> None:
@@ -278,8 +279,7 @@ class OnlineTimeWarpingArztMultiFold(OnlineTimeWarpingArztFrame):
             )
 
     def reset(self) -> None:
-        self.input_index = 0
-        self._alignment_path = []
+        super().reset()
         self.active_hypothesis_idx = 0
         self.latency_stats = {
             "total_latency": 0,

@@ -1,38 +1,44 @@
-"""Switching Kalman filter score following with a synthesised-score chroma
-emission, IMM tempo modes and a measure graph.
+"""Chord-state switching Kalman follower with IMM tempo modes and a measure graph.
 
 Position is a discrete chord state with an age, as in Jiang & Raphael's
 switching state-space model (``skf.py``): a chord ends by its duration model
-under the tempo of the hypothesis. Three extensions: the tempo of every
-``(chord, age, route)`` hypothesis is tracked by the CV/CA/ZV mode bank that
-steers SoftOLTW (``IMMMotionModels``); a chord is heard through the chroma
-frames of the synthesised score audio that belong to it (multinomial
-likelihood of the normalised live chroma, softmin-pooled over the frames), so
-the score-to-audio gap is bridged by rendering rather than by static spectral
-templates; and at measure
-ends the directed score graph distributes the advance over structural jumps.
+under the tempo of the hypothesis. The tempo of every ``(chord, age, route)``
+hypothesis is tracked by the CV/CA/ZV mode bank (``IMMMotionModels``); the
+mode-conditioned duration hazard is the innovation likelihood that updates the
+mode probabilities at every chord transition. A chord is heard through the
+chroma frames of the synthesised score audio, time-warped by the hypothesis'
+own tempo so that its age selects the rendered frame it should be hearing; at
+measure ends the directed score graph distributes the advance over structural
+jumps.
 """
 
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import partitura as pt
 from scipy.special import logsumexp, ndtr
 
 from matchmaker.base import OnlineAlignment
+from matchmaker.dp.oltw_soft import SILENCE_PEAKINESS
 from matchmaker.features.audio import FRAME_RATE
 from matchmaker.graph.score_graph import EdgeKind, ScoreGraph
 from matchmaker.io.audio import QUEUE_TIMEOUT
 from matchmaker.io.queue import RECVQueue
-from matchmaker.dp.oltw_soft import SILENCE_PEAKINESS
 from matchmaker.prob.imm import IMMMotionModels, score_activity
+from matchmaker.prob.chord_position import estimate_chord_position
+from matchmaker.prob.chord_emission import ChordFramePool
+from matchmaker.prob.duration import gaussian_duration_stay, score_time_duration_variance
 from matchmaker.prob.skf import MAX_HYPOTHESES, PROB_FLOOR, SIGMA_EPS_SCALE, SIGMA_ETA_SCALE, build_chord_sequence
 from matchmaker.utils.misc import set_latency_stats
 
 CV, CA, ZV = 0, 1, 2
+# +-10% initial tempo uncertainty, as in the original switching model (skf.py);
+# preferred over the validation split's own spread (0.23) on the validation split
+TEMPO_PRIOR = 0.1
 
 
-class IMMSwitchingKalmanFollower(OnlineAlignment):
+class IMMGraphFollower(OnlineAlignment):
 
     def __init__(
         self,
@@ -48,7 +54,11 @@ class IMMSwitchingKalmanFollower(OnlineAlignment):
         max_hypotheses: int = MAX_HYPOTHESES,
         sigma_eps_scale: float = SIGMA_EPS_SCALE,
         sigma_eta_scale: float = SIGMA_ETA_SCALE,
+        tempo_prior: float = TEMPO_PRIOR,
         modes: Tuple[str, ...] = ("cv", "ca", "zv"),
+        position_estimator: str = "map",
+        duration_model: str = "legacy",
+        emission_model: str = "frame",
         **kwargs,
     ):
         super().__init__(reference_features=reference_features, score_positions=score_positions, queue=queue)
@@ -56,6 +66,15 @@ class IMMSwitchingKalmanFollower(OnlineAlignment):
         self.sigma_eps_scale = sigma_eps_scale
         self.sigma_eta_scale = sigma_eta_scale
         self.delta = 1.0 / frame_rate
+        if position_estimator not in ("map", "mean"):
+            raise ValueError("position_estimator must be 'map' or 'mean'")
+        if duration_model not in ("legacy", "score_time"):
+            raise ValueError("duration_model must be 'legacy' or 'score_time'")
+        self.position_estimator = position_estimator
+        self.duration_model = duration_model
+        if emission_model not in ("frame", "pooled"):
+            raise ValueError("emission_model must be 'frame' or 'pooled'")
+        self.emission_model = emission_model
 
         self.chords, self.lengths, self.onset_beats = build_chord_sequence(note_array)
         self.K = len(self.chords)
@@ -63,30 +82,27 @@ class IMMSwitchingKalmanFollower(OnlineAlignment):
         reference = np.maximum(np.asarray(reference_features, dtype=float), PROB_FLOOR)
         self.log_reference = np.log(reference / reference.sum(axis=1, keepdims=True))
         beats = np.asarray(ref_frame_to_beat, dtype=float)
-        # every score frame belongs to the chord sounding at it, and every chord
-        # owns at least the frame at its onset (chords may be shorter than a frame)
-        chord_of_frame = np.clip(np.searchsorted(self.onset_beats, beats, side="right") - 1, 0, self.K - 1)
+        self.chord_emission = ChordFramePool(beats, self.onset_beats) if emission_model == "pooled" else None
         onset_frame = np.clip(np.searchsorted(beats, self.onset_beats), 0, len(beats) - 1)
-        pairs = np.unique(np.concatenate([
-            np.stack([np.arange(len(beats)), chord_of_frame], 1),
-            np.stack([onset_frame, np.arange(self.K)], 1),
-        ]), axis=0)
-        self.frame_index, self.chord_of_frame = pairs[:, 0], pairs[:, 1]
-        # a rest is heard as the score's own silent frames, or as a flat chroma
+        self.onset_frame = onset_frame
+        self.last_frame = np.r_[np.maximum(onset_frame[1:] - 1, onset_frame[:-1]), len(beats) - 1]
         sounding = score_activity(score_part, beats, len(reference))
         self.log_rest = self.log_reference[~sounding] if not sounding.all() else np.full(
             (1, reference.shape[1]), -np.log(reference.shape[1])
         )
 
-        self.motion = IMMMotionModels(
-            score_part=score_part, tempo=tempo, frame_rate=frame_rate, modes=modes
-        )
+        self.motion = IMMMotionModels(score_part=score_part, tempo=tempo, frame_rate=frame_rate, modes=modes)
         ends = np.r_[self.onset_beats[1:], np.inf]
         self.paused = np.zeros(self.K, dtype=bool)
         for start, end in self.motion.pause_ranges:
             self.paused |= (self.onset_beats < end) & (ends > start)
         self.init_tempo = 240.0 / tempo
-        self.init_tempo_var = (self.init_tempo * 0.1) ** 2
+        self.init_tempo_var = (tempo_prior * self.init_tempo) ** 2
+        marks = sorted((float(score_part.beat_map(o.start.t)), float(o.bpm))
+                       for o in score_part.iter_all(pt.score.Tempo) if o.bpm) if score_part is not None else []
+        self.marked_tempo = np.full(self.K, tempo, dtype=float)
+        for beat, bpm in marks:
+            self.marked_tempo[self.onset_beats >= beat - 1e-6] = bpm
         self.jumps = self._chord_jumps(score_graph)
         self.routes: List[Tuple[str, ...]] = [()]
         self.route_ids: Dict[Tuple[str, ...], int] = {(): 0}
@@ -105,10 +121,7 @@ class IMMSwitchingKalmanFollower(OnlineAlignment):
             return jumps
         nodes = sorted(graph.nodes.values(), key=lambda n: n.score_beat)
         starts = np.array([n.score_beat for n in nodes])
-        first_chord = dict(zip(
-            (n.node_id for n in nodes),
-            np.searchsorted(self.onset_beats, starts - 1e-6),
-        ))
+        first_chord = dict(zip((n.node_id for n in nodes), np.searchsorted(self.onset_beats, starts - 1e-6)))
         node_of_chord = np.searchsorted(starts, self.onset_beats + 1e-6) - 1
         for i, node in enumerate(nodes):
             transitions = graph.transition_distribution(node.node_id)
@@ -147,27 +160,21 @@ class IMMSwitchingKalmanFollower(OnlineAlignment):
             self.routes.append(route)
         return self.route_ids[route]
 
-    def _log_likelihoods(self, features: np.ndarray) -> np.ndarray:
-        """Multinomial chroma log-likelihood of every chord and, last, of a rest, softmin-pooled over frames."""
+    def _log_frame_likelihoods(self, features: np.ndarray) -> np.ndarray:
+        """Multinomial chroma log-likelihood of every rendered score frame and, last, of a rest."""
         y = np.maximum(np.asarray(features, dtype=float).reshape(-1, self.log_reference.shape[1])[-1], 0.0)
         y = y / y.sum() if y.any() else np.full_like(y, 1.0 / len(y))
-        log_frames = (self.log_reference @ y)[self.frame_index]
-        pooled = np.full(self.K + 1, -np.inf)
-        np.maximum.at(pooled, self.chord_of_frame, log_frames)
-        shifted = np.exp(log_frames - pooled[self.chord_of_frame])
-        counts = np.bincount(self.chord_of_frame, minlength=self.K)
-        sums = np.bincount(self.chord_of_frame, shifted, minlength=self.K)
-        pooled[:-1] += np.log(sums / counts)
-        pooled[-1] = logsumexp(self.log_rest @ y) - np.log(len(self.log_rest))
-        return pooled
+        return np.r_[self.log_reference @ y, logsumexp(self.log_rest @ y) - np.log(len(self.log_rest))]
+
+    def _heard(self, log_frames, frame):
+        """Softmin-pooled log-likelihood of the rendered frame and its neighbours."""
+        window = np.stack([log_frames[np.clip(frame + d, 0, len(log_frames) - 2)] for d in (-1, 0, 1)])
+        return logsumexp(window, axis=0) - np.log(3.0)
 
     def _mix(self):
         """IMM interaction over one frame; a pause is reachable where the score allows one."""
-        transition = np.where(
-            self.paused[self.k][:, None, None], self.motion.M_pause, self.motion.M_play
-        )
+        transition = np.where(self.paused[self.k][:, None, None], self.motion.M_pause, self.motion.M_play)
         c = np.einsum("hi,hij->hj", self.w, transition)
-        # modes without mass keep their own estimate instead of a 0/0 mixture
         mixing = np.divide(
             self.w[:, :, None] * transition, c[:, None, :],
             out=np.tile(np.eye(3), (len(c), 1, 1)), where=c[:, None, :] > 0,
@@ -185,7 +192,6 @@ class IMMSwitchingKalmanFollower(OnlineAlignment):
         std = np.sqrt((self.sigma_eps_scale * tempo) ** 2 + length[:, None] ** 2 * P[:, :, 0, 0])
         survival = 1.0 - ndtr((age[:, None] * self.delta - mean) / std)
         if self.motion.enabled[ZV]:
-            # a held chord or rest ends by the zero-velocity sojourn, decided acoustically
             survival[:, ZV] = np.exp(-age * self.delta / self.motion.beat_seconds)
         return survival
 
@@ -193,7 +199,10 @@ class IMMSwitchingKalmanFollower(OnlineAlignment):
         """Kalman update of tempo from the observed chord duration, then predict."""
         tempo = x[:, :, 0]
         l = length[:, None]
-        S = l**2 * P[:, :, 0, 0] + (self.sigma_eps_scale * tempo) ** 2
+        observation_variance = (self.sigma_eps_scale * tempo) ** 2
+        if self.duration_model == "score_time":
+            observation_variance = score_time_duration_variance(l, tempo, self.sigma_eps_scale)
+        S = l**2 * P[:, :, 0, 0] + observation_variance
         gain = P[:, :, :, 0] * l[:, :, None] / S[:, :, None]
         if self.motion.enabled[ZV]:
             gain[:, ZV] = 0.0
@@ -219,26 +228,43 @@ class IMMSwitchingKalmanFollower(OnlineAlignment):
             if feature.max() < SILENCE_PEAKINESS * (feature.mean() + 1e-10):
                 return
             self._music_started = True
-        log_liks = self._log_likelihoods(features)
+        log_frames = self._log_frame_likelihoods(features)
         c, x, P = self._mix()
         length = self.lengths[self.k]
-        # likelihoods are relative to the chords the beam can reach this frame
-        jump_targets = [t for k in self.k if int(k) in self.jumps for t, _, _ in self.jumps[int(k)][1]]
-        reachable = np.concatenate([self.k, np.minimum(self.k + 1, self.K - 1), [self.K], jump_targets]).astype(int)
-        liks = np.exp(log_liks - log_liks[reachable].max())
 
-        survive = self._survival(length, x, P, self.a)
-        survive_next = self._survival(length, x, P, self.a + 1)
-        alive = survive > 0
-        stay_m = np.where(alive, survive_next / np.where(alive, survive, 1.0), 0.0)
+        if self.chord_emission is not None:
+            log_onset = self.chord_emission(log_frames[:-1])
+            log_stay = np.repeat(log_onset[self.k, None], 3, axis=1)
+            if self.motion.enabled[ZV]:
+                log_stay[:, ZV] = np.logaddexp(log_onset[self.k], log_frames[-1]) - np.log(2.0)
+        else:
+            rendered = self.onset_frame[self.k][:, None] + np.rint(self.a[:, None] * self.init_tempo / x[:, :, 0]).astype(int)
+            rendered = np.minimum(rendered, self.last_frame[self.k][:, None])
+            log_stay = self._heard(log_frames, rendered)
+            if self.motion.enabled[ZV]:
+                held = self._heard(log_frames, self.last_frame[self.k])
+                log_stay[:, ZV] = np.logaddexp(held, log_frames[-1]) - np.log(2.0)
+            log_onset = self._heard(log_frames, self.onset_frame)
+        scale = max(log_stay.max(), log_onset[np.minimum(self.k + 1, self.K - 1)].max())
+        acoustic = np.exp(log_stay - scale)
+        onset_liks = np.exp(log_onset - scale)
+
+        if self.duration_model == "score_time":
+            l, tempo = length[:, None], x[:, :, 0]
+            variance = score_time_duration_variance(l, tempo, self.sigma_eps_scale)
+            variance += l**2 * P[:, :, 0, 0]
+            stay_m = gaussian_duration_stay(l * tempo, variance, self.a[:, None], self.delta)
+            if self.motion.enabled[ZV]:
+                stay_m[:, ZV] = np.exp(-self.delta / self.motion.beat_seconds)
+        else:
+            survive = self._survival(length, x, P, self.a)
+            survive_next = self._survival(length, x, P, self.a + 1)
+            alive = survive > 0
+            stay_m = np.where(alive, survive_next / np.where(alive, survive, 1.0), 0.0)
         can_advance = (self.k + 1 < self.K) | np.isin(self.k, list(self.jumps))
         stay_m = np.where(can_advance[:, None], stay_m, 1.0)
 
-        # moving modes hear the chord; a held chord or rest is heard as the chord or as silence
-        acoustic = np.repeat(liks[self.k][:, None], 3, axis=1)
-        acoustic[:, ZV] = (liks[self.k] + liks[-1]) / 2.0
-        rows = [(np.stack([self.k, self.a + 1, self.r], 1),
-                 self.p[:, None] * acoustic * c * stay_m, x, P)]
+        rows = [(np.stack([self.k, self.a + 1, self.r], 1), self.p[:, None] * acoustic * c * stay_m, x, P)]
 
         advance = c * (1.0 - stay_m)
         parent = np.flatnonzero(can_advance & (advance.sum(axis=1) > 0))
@@ -258,12 +284,14 @@ class IMMSwitchingKalmanFollower(OnlineAlignment):
             share = np.r_[share, e[:, 2].astype(float)]
             route = np.r_[route, e[:, 3].astype(int)]
         xa, Pa = self._advance(x[parent], P[parent], length[parent], self.a[parent] * self.delta)
-        # the end of the score is absorbing: advancing past it stays on the last chord
+        landing = np.minimum(target, self.K - 1)
+        changed = self.marked_tempo[self.k[parent]] != self.marked_tempo[landing]
+        Pa[changed, :, 0, 0] = xa[changed, :, 0] ** 2
         ended = target >= self.K
         target = np.where(ended, self.k[parent], target)
         age = np.where(ended, self.a[parent] + 1, 1)
         rows.append((np.stack([target, age, route], 1),
-                     (self.p[parent] * share * liks[target])[:, None] * advance[parent], xa, Pa))
+                     (self.p[parent] * share * onset_liks[target])[:, None] * advance[parent], xa, Pa))
 
         key, u, x, P = (np.concatenate(parts) for parts in zip(*rows))
         prob = u.sum(axis=1)
@@ -277,7 +305,6 @@ class IMMSwitchingKalmanFollower(OnlineAlignment):
         np.add.at(p_sum, inverse, prob)
         w_sum = np.zeros((m, 3))
         np.add.at(w_sum, inverse, u)
-        # a mode without mass inherits the hypothesis estimate
         weight = np.where(w_sum[inverse] > 0, u, prob[:, None])
         mass = np.where(w_sum > 0, w_sum, p_sum[:, None])
         w = w_sum / p_sum[:, None]
@@ -292,6 +319,19 @@ class IMMSwitchingKalmanFollower(OnlineAlignment):
         self.k, self.a, self.r = key[keep, 0], key[keep, 1], key[keep, 2]
         self.p = p_sum[keep] / p_sum[keep].sum()
         self.x, self.P, self.w = x[keep], P[keep], w[keep]
+
+        if self.position_estimator == "mean":
+            self._position, route = estimate_chord_position(
+                self.onset_beats, self.lengths, self.k, self.a, self.r,
+                self.p, self.w, self.x[:, :, 0], self.delta,
+            )
+            self.current_route = self.routes[route]
+            self.current_index = int(np.clip(
+                np.searchsorted(self.onset_beats, self._position, side="right") - 1,
+                0, self.K - 1,
+            ))
+            self.input_index += 1
+            return
 
         chord_p = np.zeros(self.K)
         np.add.at(chord_p, self.k, self.p)
@@ -312,7 +352,6 @@ class IMMSwitchingKalmanFollower(OnlineAlignment):
         return self._position
 
     def is_still_following(self) -> bool:
-        # reaching the last chord may precede a structural jump back
         return True
 
     def __call__(self, observation, perf_time: float) -> float:

@@ -84,7 +84,6 @@ class OnlineTimeWarpingArzt(OnlineAlignment):
         )
         self.N_ref: int = self.reference_features.shape[0]
         self.step_size: int = step_size
-        self.reset()
 
     def reset(self) -> None:
         self.current_index = 0
@@ -165,6 +164,7 @@ class OnlineTimeWarpingArztFrame(OnlineTimeWarpingArzt):
             "min_latency": float("inf"),
         }
         self._init_distance_func(distance_func)
+        self.reset()
 
     def __call__(self, observation: Any, perf_time: float) -> float:
         t0 = time.time()
@@ -305,6 +305,17 @@ class OnlineTimeWarpingArztTempoFrame(OnlineTimeWarpingArztFrame):
         use_tempo_model: bool = True,
         **kwargs,
     ) -> None:
+        if ref_frame_to_beat is None:
+            raise ValueError(
+                "Frame-level Arzt requires `ref_frame_to_beat` (per-frame beat mapping)."
+            )
+        self.use_tempo_model = use_tempo_model
+        self.tempo_window_size = tempo_window_size
+        self.tempo_min_past = tempo_min_past
+        self.tempo_n_onsets = tempo_n_onsets
+        self.random_seed = random_seed
+        self._original_reference_features = reference_features.copy()
+        self._original_ref_frame_to_beat = ref_frame_to_beat.copy()
         super().__init__(
             reference_features=reference_features,
             score_positions=score_positions,
@@ -317,13 +328,6 @@ class OnlineTimeWarpingArztTempoFrame(OnlineTimeWarpingArztFrame):
             queue=queue,
             **kwargs,
         )
-        self.use_tempo_model = use_tempo_model
-        self.tempo_window_size = tempo_window_size
-        self.tempo_min_past = tempo_min_past
-        self.tempo_n_onsets = tempo_n_onsets
-        self.random_seed = random_seed
-        self._original_reference_features = reference_features.copy()
-        self._original_ref_frame_to_beat = ref_frame_to_beat.copy()
         self.reset()
 
     def reset(self) -> None:
@@ -331,36 +335,22 @@ class OnlineTimeWarpingArztTempoFrame(OnlineTimeWarpingArztFrame):
         self.current_relative_tempo: float = 1.0
         self._consecutive_alterations: int = 0
         self._backpointers: list = []
-        seed = getattr(self, "random_seed", 1984)
-        self._rng = np.random.RandomState(seed)
-        if (
-            hasattr(self, "_original_reference_features")
-            and self._original_reference_features is not None
-        ):
-            self.reference_features = self._original_reference_features.copy()
-            self._ref_frame_to_beat = self._original_ref_frame_to_beat.copy()
-            self.N_ref = self.reference_features.shape[0]
-            self.global_cost_matrix = np.full(
-                (self.N_ref + 1, 2), np.inf, dtype=np.float32
-            )
+        self._rng = np.random.RandomState(self.random_seed)
+        # The tempo model stretches the reference on the fly; restore the
+        # pristine copy so each run starts from the notated score.
+        self.reference_features = self._original_reference_features.copy()
+        self._ref_frame_to_beat = self._original_ref_frame_to_beat.copy()
+        self.N_ref = self.reference_features.shape[0]
+        self.global_cost_matrix = np.full(
+            (self.N_ref + 1, 2), np.inf, dtype=np.float32
+        )
         self._init_onset_mask()
 
     def _init_onset_mask(self) -> None:
-        if not hasattr(self, "N_ref"):
-            return
         self.is_onset_frame = np.zeros(self.N_ref, dtype=bool)
-        if (
-            hasattr(self, "score_positions")
-            and self.score_positions is not None
-            and len(self.score_positions) > 0
-            and hasattr(self, "_ref_frame_to_beat")
-            and self._ref_frame_to_beat is not None
-        ):
-            onset_frames = np.searchsorted(
-                self._ref_frame_to_beat, self.score_positions
-            )
-            valid = onset_frames < self.N_ref
-            self.is_onset_frame[onset_frames[valid]] = True
+        onset_frames = np.searchsorted(self._ref_frame_to_beat, self.score_positions)
+        valid = onset_frames < self.N_ref
+        self.is_onset_frame[onset_frames[valid]] = True
 
     def _get_backward_path(self, max_history_frames: int = 500) -> list:
         """Trace backward path from current position using recorded backpointers."""
@@ -624,6 +614,7 @@ class OnlineTimeWarpingArztEvent(OnlineTimeWarpingArzt):
         self._window_size = window_size
         self._start_window_size = start_window_size
         self._scipy_metric = distance_func
+        self.reset()
 
     def get_window(self) -> Tuple[int, int]:
         w = self._window_size

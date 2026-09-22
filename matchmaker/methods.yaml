@@ -267,8 +267,8 @@ methods:
         hop_length: 128
         n_fft: 512
 
-    skf_imm:
-      class: matchmaker.prob.skf_imm:IMMSwitchingKalmanFollower
+    imm_graph:
+      class: matchmaker.prob.imm_graph:IMMGraphFollower
       reference: score_audio
       args:
         <<: *oltw_frame_args
