@@ -106,3 +106,36 @@ def score_activity(score_part, beats, size):
     return np.searchsorted(starts, beats, side="right") > np.searchsorted(
         ends, beats, side="right"
     )
+
+
+# ---------------------------------------------------------------------------
+# Vectorised IMM primitives (Blom & Bar-Shalom): a batch of hypotheses, each with one
+# scalar state per mode. Checked against filterpy.kalman.IMMEstimator in the tests.
+# ---------------------------------------------------------------------------
+
+def stationary_distribution(transition: np.ndarray) -> np.ndarray:
+    """Stationary distribution of a Markov transition matrix (rows sum to one)."""
+    values, vectors = np.linalg.eig(transition.T)
+    pi = np.real(vectors[:, np.argmin(np.abs(values - 1))])
+    return pi / pi.sum()
+
+
+def interact(mu: np.ndarray, transition: np.ndarray, x: np.ndarray, P: np.ndarray):
+    """IMM interaction: predicted mode probabilities and each mode's mixed initial condition.
+
+    mu, x, P: (hypotheses, modes); transition: (modes, modes) or one per hypothesis
+    (hypotheses, modes, modes). Returns (c, x0, P0) shaped like mu.
+    """
+    transition = np.broadcast_to(transition, (len(mu),) + transition.shape[-2:])
+    c = np.einsum("hi,hij->hj", mu, transition)
+    mix = mu[:, :, None] * transition / np.maximum(c[:, None, :], np.finfo(float).tiny)
+    x0 = np.einsum("hij,hi->hj", mix, x)
+    P0 = np.einsum("hij,hij->hj", mix, P[:, :, None] + (x[:, :, None] - x0[:, None, :]) ** 2)
+    return c, x0, P0
+
+
+def kalman_update(x: np.ndarray, P: np.ndarray, residual: np.ndarray, H: np.ndarray, R: np.ndarray):
+    """Scalar Kalman update with the Joseph-form covariance, element-wise over any shape."""
+    S = H ** 2 * P + R
+    K = P * H / S
+    return x + K * residual, (1 - K * H) ** 2 * P + K ** 2 * R

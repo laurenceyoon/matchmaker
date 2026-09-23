@@ -47,3 +47,32 @@ def test_score_activity_includes_overlapping_notes_and_rests():
     np.testing.assert_array_equal(
         score_activity(part, np.arange(6), 6), [True, True, True, False, True, False]
     )
+
+
+def test_imm_primitives_match_filterpy_imm_estimator():
+    from filterpy.kalman import IMMEstimator, KalmanFilter
+    from matchmaker.prob.imm import interact, kalman_update, stationary_distribution
+
+    rng = np.random.default_rng(0)
+    transition = np.array([[0.97, 0.03], [0.2, 0.8]])
+    Q, H, R = np.array([1e-4, 0.3]), 1.7, 0.05
+    filters = []
+    for q in Q:
+        kf = KalmanFilter(dim_x=1, dim_z=1)
+        kf.x, kf.P, kf.F, kf.Q, kf.H, kf.R = np.array([[1.0]]), np.array([[0.5]]), np.eye(1), np.array([[q]]), np.array([[H]]), np.array([[R]])
+        filters.append(kf)
+    mu0 = stationary_distribution(transition)
+    reference = IMMEstimator(filters, mu0.copy(), transition)
+    mu, x, P = mu0[None], np.ones((1, 2)), np.full((1, 2), 0.5)
+    for z in rng.normal(1.7, 0.4, 50):
+        reference.predict()
+        reference.update(np.array([[z]]))
+        c, x, P = interact(mu, transition, x, P)
+        P = P + Q
+        S = H ** 2 * P + R
+        likelihood = np.exp(-0.5 * (z - H * x) ** 2 / S) / np.sqrt(2 * np.pi * S)
+        mu = c * likelihood / (c * likelihood).sum()
+        x, P = kalman_update(x, P, z - H * x, H, R)
+        np.testing.assert_allclose(mu[0], reference.mu, rtol=1e-9)
+        np.testing.assert_allclose(x[0], [f.x[0, 0] for f in reference.filters], rtol=1e-9)
+        np.testing.assert_allclose(P[0], [f.P[0, 0] for f in reference.filters], rtol=1e-9)
