@@ -109,8 +109,8 @@ def score_activity(score_part, beats, size):
 
 
 # ---------------------------------------------------------------------------
-# Vectorised IMM primitives (Blom & Bar-Shalom): a batch of hypotheses, each with one
-# scalar state per mode. Checked against filterpy.kalman.IMMEstimator in the tests.
+# Vectorised IMM primitives (Blom & Bar-Shalom): a batch of hypotheses, each with an
+# n-dimensional state per mode. Checked against filterpy.kalman.IMMEstimator in the tests.
 # ---------------------------------------------------------------------------
 
 def stationary_distribution(transition: np.ndarray) -> np.ndarray:
@@ -123,19 +123,26 @@ def stationary_distribution(transition: np.ndarray) -> np.ndarray:
 def interact(mu: np.ndarray, transition: np.ndarray, x: np.ndarray, P: np.ndarray):
     """IMM interaction: predicted mode probabilities and each mode's mixed initial condition.
 
-    mu, x, P: (hypotheses, modes); transition: (modes, modes) or one per hypothesis
-    (hypotheses, modes, modes). Returns (c, x0, P0) shaped like mu.
+    mu: (hypotheses, modes); transition: (modes, modes) or one per hypothesis;
+    x: (hypotheses, modes, n); P: (hypotheses, modes, n, n). Returns (c, x0, P0).
     """
     transition = np.broadcast_to(transition, (len(mu),) + transition.shape[-2:])
     c = np.einsum("hi,hij->hj", mu, transition)
     mix = mu[:, :, None] * transition / np.maximum(c[:, None, :], np.finfo(float).tiny)
-    x0 = np.einsum("hij,hi->hj", mix, x)
-    P0 = np.einsum("hij,hij->hj", mix, P[:, :, None] + (x[:, :, None] - x0[:, None, :]) ** 2)
+    x0 = np.einsum("hij,hia->hja", mix, x)
+    spread = x[:, :, None, :] - x0[:, None, :, :]
+    P0 = np.einsum("hij,hiab->hjab", mix, P) + np.einsum("hij,hija,hijb->hjab", mix, spread, spread)
     return c, x0, P0
 
 
 def kalman_update(x: np.ndarray, P: np.ndarray, residual: np.ndarray, H: np.ndarray, R: np.ndarray):
-    """Scalar Kalman update with the Joseph-form covariance, element-wise over any shape."""
-    S = H ** 2 * P + R
-    K = P * H / S
-    return x + K * residual, (1 - K * H) ** 2 * P + K ** 2 * R
+    """Kalman update by one scalar measurement, Joseph-form covariance.
+
+    x, H: (..., n); P: (..., n, n); residual, R: (...).
+    """
+    PH = np.einsum("...ab,...b->...a", P, H)
+    S = np.einsum("...a,...a->...", H, PH) + R
+    K = PH / S[..., None]
+    IKH = np.eye(x.shape[-1]) - K[..., :, None] * H[..., None, :]
+    P = np.einsum("...ab,...bc,...dc->...ad", IKH, P, IKH) + R[..., None, None] * K[..., :, None] * K[..., None, :]
+    return x + K * residual[..., None], P

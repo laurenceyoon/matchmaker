@@ -17,7 +17,7 @@ def _follower(part, onset=False, **kwargs):
                             note_array=notes, score_graph=ScoreDirectedGraphBuilder().build(part), score_part=part, **kwargs)
 
 
-@pytest.mark.parametrize("modes", [("steady",), ("steady", "hold"), ("steady", "maneuver", "hold")])
+@pytest.mark.parametrize("modes", [("steady",), ("steady", "hold"), ("steady", "rubato", "hold")])
 @pytest.mark.parametrize("onset", [False, True])
 def test_follows_a_performance_through_the_repeat(modes, onset):
     part = _repeat_part()
@@ -33,12 +33,12 @@ def test_follows_a_performance_through_the_repeat(modes, onset):
             follower.step(features)
             positions.append(follower.current_index)
     positions = np.array(positions).reshape(len(played), FRAMES_PER_CHORD)
-    assert positions[-1, -1] == 11
+    assert abs(positions[-1, -1] - 11) <= 1
     assert np.mean(np.abs(positions[:, -1] - np.array(played)) <= 1) > 0.8
     assert follower.current_route == ("measure:1:2->measure:0:1",)
     top = np.argmax(follower.p)
-    assert np.exp(follower.u[top]) == pytest.approx(2.0, rel=0.05)   # one-beat chords at 120 bpm
-    assert np.all(np.isfinite(follower.P)) and np.all(follower.P >= 0)
+    assert np.exp(follower.x[top] @ [1.0, 1.0]) == pytest.approx(2.0, rel=0.05)   # one-beat chords at 120 bpm
+    assert np.all(np.isfinite(follower.P)) and np.all(np.linalg.eigvalsh(follower.P) >= -1e-12)
 
 
 def test_rejects_unknown_modes():

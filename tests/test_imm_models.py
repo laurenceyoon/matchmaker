@@ -55,24 +55,27 @@ def test_imm_primitives_match_filterpy_imm_estimator():
 
     rng = np.random.default_rng(0)
     transition = np.array([[0.97, 0.03], [0.2, 0.8]])
-    Q, H, R = np.array([1e-4, 0.3]), 1.7, 0.05
+    F = np.array([np.diag([1.0, 0.9]), np.diag([1.0, 0.5])])
+    Q = np.array([np.diag([1e-4, 0.01]), np.diag([1e-4, 0.3])])
+    H, R = np.array([1.7, 1.7]), 0.05
     filters = []
-    for q in Q:
-        kf = KalmanFilter(dim_x=1, dim_z=1)
-        kf.x, kf.P, kf.F, kf.Q, kf.H, kf.R = np.array([[1.0]]), np.array([[0.5]]), np.eye(1), np.array([[q]]), np.array([[H]]), np.array([[R]])
+    for f, q in zip(F, Q):
+        kf = KalmanFilter(dim_x=2, dim_z=1)
+        kf.x, kf.P, kf.F, kf.Q, kf.H, kf.R = np.array([[1.0], [0.0]]), np.diag([0.5, 0.1]), f, q, H[None], np.array([[R]])
         filters.append(kf)
     mu0 = stationary_distribution(transition)
     reference = IMMEstimator(filters, mu0.copy(), transition)
-    mu, x, P = mu0[None], np.ones((1, 2)), np.full((1, 2), 0.5)
+    mu, x, P = mu0[None], np.tile([1.0, 0.0], (1, 2, 1)), np.tile(np.diag([0.5, 0.1]), (1, 2, 1, 1))
     for z in rng.normal(1.7, 0.4, 50):
         reference.predict()
         reference.update(np.array([[z]]))
         c, x, P = interact(mu, transition, x, P)
-        P = P + Q
-        S = H ** 2 * P + R
-        likelihood = np.exp(-0.5 * (z - H * x) ** 2 / S) / np.sqrt(2 * np.pi * S)
+        x, P = np.einsum("jab,hjb->hja", F, x), np.einsum("jab,hjbc,jdc->hjad", F, P, F) + Q
+        S = np.einsum("a,hjab,b->hj", H, P, H) + R
+        residual = z - x @ H
+        likelihood = np.exp(-0.5 * residual ** 2 / S) / np.sqrt(2 * np.pi * S)
         mu = c * likelihood / (c * likelihood).sum()
-        x, P = kalman_update(x, P, z - H * x, H, R)
+        x, P = kalman_update(x, P, residual, np.broadcast_to(H, x.shape), np.full(residual.shape, R))
         np.testing.assert_allclose(mu[0], reference.mu, rtol=1e-9)
-        np.testing.assert_allclose(x[0], [f.x[0, 0] for f in reference.filters], rtol=1e-9)
-        np.testing.assert_allclose(P[0], [f.P[0, 0] for f in reference.filters], rtol=1e-9)
+        np.testing.assert_allclose(x[0], [f.x[:, 0] for f in reference.filters], rtol=1e-9, atol=1e-12)
+        np.testing.assert_allclose(P[0], [f.P for f in reference.filters], rtol=1e-9, atol=1e-12)
