@@ -37,7 +37,7 @@ def test_follows_a_performance_through_the_repeat(modes, onset):
     assert np.mean(np.abs(positions[:, -1] - np.array(played)) <= 1) > 0.8
     assert follower.current_route == ("measure:1:2->measure:0:1",)
     top = np.argmax(follower.p)
-    modes = follower.w[top, :follower.D] + follower.w[top, follower.D:]
+    modes = follower.w[top].reshape(-1, follower.D).sum(axis=0)
     tempo = np.exp(follower.x[top] @ [1.0, 1.0]) @ (modes / modes.sum())
     assert tempo == pytest.approx(2.0, rel=0.05)   # one-beat chords at 120 bpm
     assert np.all(np.isfinite(follower.P)) and np.all(np.linalg.eigvalsh(follower.P) >= -1e-12)

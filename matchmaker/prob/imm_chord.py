@@ -27,6 +27,7 @@ leaves the tempo untouched. All noise parameters are maximum-likelihood fits on 
 validation split (see the constants).
 """
 
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -45,7 +46,8 @@ from matchmaker.prob.imm import interact, kalman_update, score_activity
 from matchmaker.prob.skf import MAX_HYPOTHESES, PROB_FLOOR, build_chord_sequence
 from matchmaker.utils.misc import set_latency_stats
 
-MODE_NAMES = ("cv", "ca", "zv")
+MODE_NAMES = ("cv", "ca", "zv", "free", "outlier")
+BLOCKS = 3      # each dynamics mode plays, holds (ZV) or runs free
 N_CHROMA = 12
 SILENCE_PEAKINESS = 2.0
 
@@ -76,6 +78,44 @@ HOLD_PRIOR = 0.5
 ONSET_LOG_FLUX = [-3.025, -2.545, -2.198, -1.824, -1.419, -1.090, -0.805, -0.586, -0.380]
 ONSET_LOG_LR = [-4.386, -3.169, -1.997, -0.702, 0.529, 1.397, 2.059, 2.446, 2.641]
 TEMPO = np.array([1.0, 1.0])     # u = b + e: the observation direction of the state
+# An outlier chord (agogic stretch, arpeggio, missed onset) follows a much wider duration law.
+# As a clutter hypothesis in PDA, it does not widen the prediction (the hazard that times the
+# advance keeps the normal law, so position hypotheses stay as discriminated as before); it only
+# weights the tempo update: the posterior outlier probability of an observed duration is left
+# out of the Kalman update (maximum likelihood with the sensor noise)
+OUTLIER_PRIOR, OUTLIER_SPREAD = 0.03, 1.5
+
+
+FREE_START = re.compile(r"ad lib|cadenza|a piacere|senza tempo|eingang", re.IGNORECASE)
+FREE_END = re.compile(r"a tempo|in tempo|tempo i\b|tempo primo", re.IGNORECASE)
+
+
+def free_spans(score_part, onset_beats):
+    """Chords where the notation releases the beat: inside a measure at least one beat longer
+    than its time signature (a cadenza bar; smaller excesses are tuplet rounding), a fermata chord whose successor carries grace notes (an
+    Eingang), and chords from an "ad lib."/"cadenza" direction to the next "a tempo"."""
+    free = np.zeros(len(onset_beats), dtype=bool)
+    if score_part is None:
+        return free
+    beat = lambda t: float(score_part.beat_map(t))
+    for m in score_part.iter_all(pt.score.Measure):
+        nominal = score_part.time_signature_map(m.start.t)[0]
+        if beat(m.end.t) - beat(m.start.t) >= nominal + 1 - 1e-6:
+            free |= (onset_beats >= beat(m.start.t) - 1e-6) & (onset_beats < beat(m.end.t) - 1e-6)
+    grace = {round(beat(n.start.t), 6) for n in score_part.iter_all(pt.score.GraceNote)}
+    for f in score_part.iter_all(pt.score.Fermata):
+        if getattr(f.ref, "start", None) is None:
+            continue
+        k = int(np.searchsorted(onset_beats, beat(f.ref.start.t) - 1e-6))
+        if k + 1 < len(onset_beats) and round(float(onset_beats[k + 1]), 6) in grace:
+            free[k] = True
+    words = sorted((beat(w.start.t), w.text or "") for w in score_part.iter_all(pt.score.Words))
+    for i, (b, text) in enumerate(words):
+        if FREE_START.search(text):
+            end = next((b2 for b2, t2 in words[i + 1:] if FREE_END.search(t2)), None)
+            if end is not None:
+                free |= (onset_beats >= b - 1e-6) & (onset_beats < end - 1e-6)
+    return free
 
 
 class IMMChordFollower(OnlineAlignment):
@@ -104,6 +144,7 @@ class IMMChordFollower(OnlineAlignment):
         self.reversion = np.array(fit["reversion"], dtype=float)
         self.deviation = np.array(fit["deviation"], dtype=float)
         self.target = np.array(fit.get("target", np.zeros(len(self.reversion))), dtype=float)
+        self.rate = np.array(fit.get("rate", np.zeros(len(self.reversion))), dtype=float)
         residence = np.array(fit["residence"], dtype=float)
         self.D = len(self.reversion)
         self.generator = (np.ones((self.D, self.D)) - self.D * np.eye(self.D)) / (residence[:, None] * max(self.D - 1, 1))
@@ -136,7 +177,9 @@ class IMMChordFollower(OnlineAlignment):
         for f in score_part.iter_all(pt.score.Fermata) if score_part is not None else ():
             if getattr(f.ref, "start", None) is not None:
                 fermata |= np.isclose(self.onset_beats, float(score_part.beat_map(f.ref.start.t)))
-        self.hold_prior = np.where(fermata & self.hold_enabled, HOLD_PRIOR, 0.0)
+        self.free_prior = (free_spans(score_part, self.onset_beats) & ("free" in modes)).astype(float)
+        self.hold_prior = np.where(fermata & self.hold_enabled, HOLD_PRIOR, 0.0) * (1 - self.free_prior)
+        self.robust_update = "outlier" in modes
 
         self.marked_tempo = 240.0 / tempo
         self.beat_seconds = 60.0 / tempo
@@ -178,9 +221,10 @@ class IMMChordFollower(OnlineAlignment):
         return jumps
 
     def _chord_modes(self, dynamics, chord):
-        """Mode weights of a chord that starts: each dynamics mode, then its held twin."""
-        h = self.hold_prior[chord][:, None]
-        return np.hstack([dynamics * (1 - h), dynamics * h])
+        """Mode weights of a chord that starts: each dynamics mode playing, holding (ZV), or
+        running free; in a free span the notation leaves only the free mode."""
+        h, f = self.hold_prior[chord][:, None], self.free_prior[chord][:, None]
+        return np.hstack([dynamics * (1 - h - f), dynamics * h, dynamics * f])
 
     def reset(self) -> None:
         self.k = np.zeros(1, dtype=np.int64)
@@ -222,26 +266,30 @@ class IMMChordFollower(OnlineAlignment):
 
     def _survival(self, length, x, P, age):
         """P(a run of notated `length` lasts beyond `age` frames): each dynamics mode, then
-        each held twin. x, P: (rows, modes, 2[, 2])."""
+        each held and free twin. x, P: (rows, modes, 2[, 2])."""
         tempo = np.exp(x @ TEMPO)
         expected = length[:, None] * tempo
         tempo_var = np.einsum("a,hmab,b->hm", TEMPO, P, TEMPO)
         t = age[:, None] * self.delta
         z = (t - expected) / np.sqrt(expected ** 2 * tempo_var + self._duration_noise(expected))
         hold_mean = self.beat_seconds * tempo / self.marked_tempo     # one beat at the tempo
-        return np.hstack([1.0 - ndtr(z), np.exp(-t / hold_mean)])
+        # free time: only the expected duration is known, so the maximum-entropy duration
+        # is exponential with that mean
+        return np.hstack([1.0 - ndtr(z), np.exp(-t / hold_mean), np.exp(-t / expected)])
 
     def _prediction_model(self, length):
         """Per-mode transition, state transition, input and process noise over `length` whole
         notes: the deviation reverts toward its mode's target."""
         if length not in self._prediction:
-            phi = np.exp(-length / self.reversion)
+            ramp = self.rate != 0                       # a ramp mode pushes the deviation at a constant rate
+            phi = np.where(ramp, 1.0, np.exp(-length / self.reversion))
             F = np.zeros((self.D, 2, 2))
             F[:, 0, 0], F[:, 1, 1] = 1.0, phi
             B = np.zeros((self.D, 2))
-            B[:, 1] = (1 - phi) * self.target
+            B[:, 1] = np.where(ramp, self.rate * length, (1 - phi) * self.target)
             Q = np.zeros((self.D, 2, 2))
-            Q[:, 0, 0], Q[:, 1, 1] = self.base_drift * length, self.deviation * (1 - phi ** 2)
+            Q[:, 0, 0] = self.base_drift * length
+            Q[:, 1, 1] = np.where(ramp, self.deviation * length / self.reversion, self.deviation * (1 - phi ** 2))
             self._prediction[length] = (expm(self.generator * length), F, B, Q)
         return self._prediction[length]
 
@@ -261,7 +309,7 @@ class IMMChordFollower(OnlineAlignment):
         emission of the chords it passes, and never passes a chord with a structural jump.
         Returns (row -> parent index, chords advanced, each mode's mass)."""
         k0, D = self.k[parent], self.D
-        mu = end[parent, :D] + end[parent, D:]
+        mu = end[parent].reshape(len(parent), BLOCKS, D).sum(axis=1)
         mu = mu / mu.sum(axis=1, keepdims=True)
         u = self.x[parent] @ TEMPO
         u_hat = (mu * u).sum(axis=1)
@@ -277,23 +325,33 @@ class IMMChordFollower(OnlineAlignment):
         S_m, S_next = (self._survival(span(n), x, P, age)[:, :D] for n in (m, m + 1))
         last = m == reach[row]
         zone = np.where(last[:, None], 1.0 - S_m, np.clip(S_next - S_m, 0.0, None))  # exactly m, or at least m at the gate
-        zone = np.hstack([zone, np.repeat((m == 1)[:, None], D, axis=1).astype(float)])  # a hold never skips
+        zone = np.hstack([zone] + [np.repeat((m == 1)[:, None], D, axis=1).astype(float)] * (BLOCKS - 1))  # nor do holds or free runs
         onset_cumsum = np.r_[0.0, np.cumsum(log_onset)]
         passed = onset_cumsum[np.minimum(k0[row] + m, self.K)] - onset_cumsum[np.minimum(k0[row] + 1, self.K)]
         passed -= np.maximum.reduceat(passed, np.cumsum(reach) - reach)[row]
         weight = zone * np.exp(passed)[:, None]
-        total = np.zeros((len(parent), 2 * D))
+        total = np.zeros((len(parent), BLOCKS * D))
         np.add.at(total, row, weight)
         return row, m, end[parent[row]] * weight / np.maximum(total[row], PROB_FLOOR)
 
     def _end_chord(self, x, P, end, length, duration):
         """Mode-matched Kalman updates by the observed duration of the chord (run) that ends.
-        `end` is each mode's mass for ending now (dynamics modes, then held twins); returns
+        `end` is each mode's mass for ending now (playing, held, free); a hold or a free run
+        says nothing about the tempo. Returns
         each dynamics mode's posterior and the posterior mode probabilities."""
         expected = length[:, None] * np.exp(x @ TEMPO)
         H = expected[..., None] * TEMPO                                 # d(duration)/d(b, e)
-        x_play, P_play = kalman_update(x, P, duration[:, None] - expected, H, self._duration_noise(expected))
-        played, held = end[:, :self.D, None], end[:, self.D:, None]
+        R = self._duration_noise(expected)
+        residual = duration[:, None] - expected
+        x_play, P_play = kalman_update(x, P, residual, H, R)
+        played, held = end[:, :self.D, None], end[:, self.D:].reshape(len(end), BLOCKS - 1, self.D).sum(axis=1)[..., None]
+        if self.robust_update:
+            tempo_var = expected ** 2 * np.einsum("a,hmab,b->hm", TEMPO, P, TEMPO)
+            S, S_wide = tempo_var + R, tempo_var + self.jitter ** 2 + (OUTLIER_SPREAD * expected) ** 2
+            normal = (1 - OUTLIER_PRIOR) * np.exp(-0.5 * residual ** 2 / S) / np.sqrt(S)
+            wide = OUTLIER_PRIOR * np.exp(-0.5 * residual ** 2 / S_wide) / np.sqrt(S_wide)
+            outlier = (wide / np.maximum(normal + wide, PROB_FLOOR))[..., None]
+            played, held = played * (1 - outlier), held + played * outlier
         mass = np.maximum(played + held, PROB_FLOOR)
         x_end = (played * x_play + held * x) / mass                     # a hold leaves the tempo untouched
         d_play, d_hold = x_play - x_end, x - x_end
@@ -327,7 +385,7 @@ class IMMChordFollower(OnlineAlignment):
             self._music_started = True
         log_frames = self._log_frame_likelihoods(chroma)
         p = self.p
-        modes = self.w[:, :self.D] + self.w[:, self.D:]
+        modes = self.w.reshape(len(self.w), BLOCKS, self.D).sum(axis=1)
         self._beam_modes = self.p @ modes / max(self.p @ modes.sum(axis=1), PROB_FLOOR)
         if self.onset_evidence:
             # an attack shows in the frame after its onset: it confirms or refutes the
@@ -341,7 +399,8 @@ class IMMChordFollower(OnlineAlignment):
                               self.last_frame[self.k][:, None])
         log_play = self._heard(log_frames, rendered)
         log_hold = np.logaddexp(self._heard(log_frames, self.last_frame[self.k]), log_frames[-1]) - np.log(2.0)
-        log_stay = np.hstack([log_play, np.repeat(log_hold[:, None], self.D, axis=1)])
+        log_free = np.full(len(self.k), -np.log(N_CHROMA))   # expects no particular frame
+        log_stay = np.hstack([log_play, np.repeat(log_hold[:, None], self.D, axis=1), np.repeat(log_free[:, None], self.D, axis=1)])
         log_onset = self._heard(log_frames, self.onset_frame)
         scale = max(log_stay.max(), log_onset[np.minimum(self.k + 1, self.K - 1)].max())
         acoustic = np.exp(log_stay - scale)
@@ -399,10 +458,10 @@ class IMMChordFollower(OnlineAlignment):
         n = len(key)
         p_sum = np.zeros(n)
         np.add.at(p_sum, inverse, prob)
-        w_sum = np.zeros((n, 2 * self.D))
+        w_sum = np.zeros((n, BLOCKS * self.D))
         np.add.at(w_sum, inverse, w_rows)
         # moment-match each dynamics mode's state over merged rows, weighted by that mode's mass
-        dm = w_rows[:, :self.D] + w_rows[:, self.D:]
+        dm = w_rows.reshape(len(w_rows), BLOCKS, self.D).sum(axis=1)
         dm_sum = np.zeros((n, self.D))
         np.add.at(dm_sum, inverse, dm)
         weight = np.where(dm_sum[inverse] > 0, dm, prob[:, None])
@@ -425,7 +484,7 @@ class IMMChordFollower(OnlineAlignment):
         tempos = np.exp(self.x @ TEMPO)
         self._position, route = estimate_chord_position(
             self.onset_beats, self.lengths, self.k, self.a, self.r, self.p, self.w,
-            np.hstack([tempos, tempos]), self.delta,
+            np.hstack([tempos] * BLOCKS), self.delta,
             hold_mode=list(range(self.D, 2 * self.D)) if self.hold_enabled else None,
         )
         self.current_route = self.routes[route]
