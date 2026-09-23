@@ -59,6 +59,7 @@ def test_repeat_jump_splits_advance_by_graph_prior(monkeypatch):
     monkeypatch.setattr(follower, "_log_frame_likelihoods", lambda features: np.zeros(len(follower.log_reference) + 1))
     follower.k[:] = 7
     follower.a[:] = 10_000
+    follower._music_started = True
     follower.step(_chroma(0))
     chords = dict(zip(follower.k.tolist(), follower.p.tolist()))
     assert chords[0] == pytest.approx(chords[8])

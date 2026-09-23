@@ -29,13 +29,21 @@ from matchmaker.prob.imm import IMMMotionModels, score_activity
 from matchmaker.prob.chord_position import estimate_chord_position
 from matchmaker.prob.chord_emission import ChordFramePool
 from matchmaker.prob.duration import gaussian_duration_stay, score_time_duration_variance
-from matchmaker.prob.skf import MAX_HYPOTHESES, PROB_FLOOR, SIGMA_EPS_SCALE, SIGMA_ETA_SCALE, build_chord_sequence
+from matchmaker.prob.skf import MAX_HYPOTHESES, PROB_FLOOR, SIGMA_ETA_SCALE, build_chord_sequence
 from matchmaker.utils.misc import set_latency_stats
 
 CV, CA, ZV = 0, 1, 2
 # +-10% initial tempo uncertainty, as in the original switching model (skf.py);
 # preferred over the validation split's own spread (0.23) on the validation split
 TEMPO_PRIOR = 0.1
+# relative tempo change between consecutive whole notes of score time: robust std
+# on the validation split at the span where onset jitter no longer contributes
+TEMPO_DRIFT = 0.06
+# chord-duration observation noise, as a fraction of a whole note; the original
+# switching model's 0.05 (about 100 ms) left tempo unidentifiable from durations.
+# Chosen on the validation split over {0.05, 0.03, 0.02, 0.01} by tracking rate,
+# then accuracy; it sits above the measured onset jitter plus frame quantization
+DURATION_JITTER = 0.02
 
 
 class IMMGraphFollower(OnlineAlignment):
@@ -52,9 +60,10 @@ class IMMGraphFollower(OnlineAlignment):
         score_part: Any = None,
         tempo: float = 120.0,
         max_hypotheses: int = MAX_HYPOTHESES,
-        sigma_eps_scale: float = SIGMA_EPS_SCALE,
+        sigma_eps_scale: float = DURATION_JITTER,
         sigma_eta_scale: float = SIGMA_ETA_SCALE,
         tempo_prior: float = TEMPO_PRIOR,
+        tempo_drift: float = TEMPO_DRIFT,
         modes: Tuple[str, ...] = ("cv", "ca", "zv"),
         position_estimator: str = "mean",
         duration_model: str = "legacy",
@@ -65,6 +74,7 @@ class IMMGraphFollower(OnlineAlignment):
         self.max_hypotheses = max_hypotheses
         self.sigma_eps_scale = sigma_eps_scale
         self.sigma_eta_scale = sigma_eta_scale
+        self.tempo_drift = tempo_drift
         self.delta = 1.0 / frame_rate
         if position_estimator not in ("map", "mean"):
             raise ValueError("position_estimator must be 'map' or 'mean'")
@@ -150,6 +160,7 @@ class IMMGraphFollower(OnlineAlignment):
         self.input_index = 0
         self.current_index = 0
         self._music_started = False
+        self._peaky_streak = 0
         self.current_route: Tuple[str, ...] = ()
         self._position = float(self.onset_beats[0])
         self._alignment_path = []
@@ -215,9 +226,14 @@ class IMMGraphFollower(OnlineAlignment):
         eta = (self.sigma_eta_scale * l * x[:, :, 0]) ** 2
         Q = np.zeros_like(P)
         Q[:, :, 0, 0] = eta
-        Q[:, CA] = eta[:, CA, None, None] * np.stack(
-            [np.stack([l[:, 0] ** 2 / 3, l[:, 0] / 2], -1),
-             np.stack([l[:, 0] / 2, np.ones(len(x))], -1)], -2)
+        # CA is the tempo-change mode: Wiener acceleration of tempo in score time,
+        # scaled so tempo can change by tempo_drift over one whole note
+        # (Var(dtau over T) = q T^3 / 3 at T = 1)
+        q = 3 * (self.tempo_drift * x[:, CA, 0]) ** 2
+        s = length
+        Q[:, CA] = q[:, None, None] * np.stack(
+            [np.stack([s**3 / 3, s**2 / 2], -1),
+             np.stack([s**2 / 2, s], -1)], -2)
         x = np.einsum("hmij,hmj->hmi", F, x)
         P = np.einsum("hmij,hmjk,hmlk->hmil", F, P, F) + Q
         return x, P
@@ -225,7 +241,13 @@ class IMMGraphFollower(OnlineAlignment):
     def step(self, features: np.ndarray) -> None:
         feature = np.abs(np.asarray(features, dtype=float)).reshape(-1)
         if not self._music_started:
-            if feature.max() < SILENCE_PEAKINESS * (feature.mean() + 1e-10):
+            # A single peaky frame is not enough: an isolated transient (a
+            # click, a breath, a mic bump) can look as peaky as a real onset
+            # for one frame. Two in a row rules out a one-frame glitch without
+            # delaying a real, sustained onset by more than a frame.
+            peaky = feature.max() >= SILENCE_PEAKINESS * (feature.mean() + 1e-10)
+            self._peaky_streak = self._peaky_streak + 1 if peaky else 0
+            if self._peaky_streak < 2:
                 return
             self._music_started = True
         log_frames = self._log_frame_likelihoods(features)
@@ -295,7 +317,9 @@ class IMMGraphFollower(OnlineAlignment):
 
         key, u, x, P = (np.concatenate(parts) for parts in zip(*rows))
         prob = u.sum(axis=1)
-        live = prob > 0
+        # mass below PROB_FLOOR relative to the leader is numerically zero: moment
+        # matching on subnormal weights returns meaningless (indefinite) covariances
+        live = prob > PROB_FLOOR * prob.max()
         key, u, x, P, prob = key[live], u[live], x[live], P[live], prob[live]
 
         key, inverse = np.unique(key, axis=0, return_inverse=True)
@@ -305,8 +329,9 @@ class IMMGraphFollower(OnlineAlignment):
         np.add.at(p_sum, inverse, prob)
         w_sum = np.zeros((m, 3))
         np.add.at(w_sum, inverse, u)
-        weight = np.where(w_sum[inverse] > 0, u, prob[:, None])
-        mass = np.where(w_sum > 0, w_sum, p_sum[:, None])
+        has_mass = w_sum > PROB_FLOOR * p_sum[:, None]
+        weight = np.where(has_mass[inverse], u, prob[:, None])
+        mass = np.where(has_mass, w_sum, p_sum[:, None])
         w = w_sum / p_sum[:, None]
         x_sum = np.zeros((m, 3, 2))
         np.add.at(x_sum, inverse, weight[:, :, None] * x)
