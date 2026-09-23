@@ -20,6 +20,7 @@ import partitura as pt
 from scipy.special import logsumexp, ndtr
 
 from matchmaker.base import OnlineAlignment
+from matchmaker.dp.oltw_soft import SILENCE_PEAKINESS
 from matchmaker.features.audio import FRAME_RATE
 from matchmaker.graph.score_graph import EdgeKind, ScoreGraph
 from matchmaker.io.audio import QUEUE_TIMEOUT
@@ -28,21 +29,13 @@ from matchmaker.prob.imm import IMMMotionModels, score_activity
 from matchmaker.prob.chord_position import estimate_chord_position
 from matchmaker.prob.chord_emission import ChordFramePool
 from matchmaker.prob.duration import gaussian_duration_stay, score_time_duration_variance
-from matchmaker.prob.skf import MAX_HYPOTHESES, PROB_FLOOR, SIGMA_ETA_SCALE, build_chord_sequence
+from matchmaker.prob.skf import MAX_HYPOTHESES, PROB_FLOOR, SIGMA_EPS_SCALE, SIGMA_ETA_SCALE, build_chord_sequence
 from matchmaker.utils.misc import set_latency_stats
 
 CV, CA, ZV = 0, 1, 2
 # +-10% initial tempo uncertainty, as in the original switching model (skf.py);
 # preferred over the validation split's own spread (0.23) on the validation split
 TEMPO_PRIOR = 0.1
-# relative tempo change between consecutive whole notes of score time: robust std
-# on the validation split at the span where onset jitter no longer contributes
-TEMPO_DRIFT = 0.06
-# chord-duration observation noise, as a fraction of a whole note; the original
-# switching model's 0.05 (about 100 ms) left tempo unidentifiable from durations.
-# Chosen on the validation split over {0.05, 0.03, 0.02, 0.01} by tracking rate,
-# then accuracy; it sits above the measured onset jitter plus frame quantization
-DURATION_JITTER = 0.02
 
 
 class IMMGraphFollower(OnlineAlignment):
@@ -59,10 +52,9 @@ class IMMGraphFollower(OnlineAlignment):
         score_part: Any = None,
         tempo: float = 120.0,
         max_hypotheses: int = MAX_HYPOTHESES,
-        sigma_eps_scale: float = DURATION_JITTER,
+        sigma_eps_scale: float = SIGMA_EPS_SCALE,
         sigma_eta_scale: float = SIGMA_ETA_SCALE,
         tempo_prior: float = TEMPO_PRIOR,
-        tempo_drift: float = TEMPO_DRIFT,
         modes: Tuple[str, ...] = ("cv", "ca", "zv"),
         position_estimator: str = "mean",
         duration_model: str = "legacy",
@@ -73,7 +65,6 @@ class IMMGraphFollower(OnlineAlignment):
         self.max_hypotheses = max_hypotheses
         self.sigma_eps_scale = sigma_eps_scale
         self.sigma_eta_scale = sigma_eta_scale
-        self.tempo_drift = tempo_drift
         self.delta = 1.0 / frame_rate
         if position_estimator not in ("map", "mean"):
             raise ValueError("position_estimator must be 'map' or 'mean'")
@@ -95,8 +86,6 @@ class IMMGraphFollower(OnlineAlignment):
         onset_frame = np.clip(np.searchsorted(beats, self.onset_beats), 0, len(beats) - 1)
         self.onset_frame = onset_frame
         self.last_frame = np.r_[np.maximum(onset_frame[1:] - 1, onset_frame[:-1]), len(beats) - 1]
-        # silence carries no pitch: its chroma is flat, a constant likelihood per frame
-        self.log_silence = -np.log(reference.shape[1])
         sounding = score_activity(score_part, beats, len(reference))
         self.log_rest = self.log_reference[~sounding] if not sounding.all() else np.full(
             (1, reference.shape[1]), -np.log(reference.shape[1])
@@ -115,6 +104,8 @@ class IMMGraphFollower(OnlineAlignment):
         for beat, bpm in marks:
             self.marked_tempo[self.onset_beats >= beat - 1e-6] = bpm
         self.jumps = self._chord_jumps(score_graph)
+        self._jump_chords = np.array(sorted(self.jumps), dtype=np.int64)
+        self._cumsum_lengths = np.concatenate([[0.0], np.cumsum(self.lengths)])
         self.routes: List[Tuple[str, ...]] = [()]
         self.route_ids: Dict[Tuple[str, ...], int] = {(): 0}
 
@@ -147,22 +138,37 @@ class IMMGraphFollower(OnlineAlignment):
                 jumps[int(chords[-1])] = (linear, targets)
         return jumps
 
+    def _cumlen(self, k, m):
+        """Cumulative nominal length (whole notes) landing `m` chords after chord `k`."""
+        idx = np.minimum(k + m, self.K)
+        return self._cumsum_lengths[idx] - self._cumsum_lengths[k]
+
+    def _skip_boundary(self, k):
+        """Nearest chord index after `k` with an outgoing structural jump, else the last chord.
+
+        A multi-chord skip must not bypass a jump chord unvisited, or a repeat could
+        be silently skipped over instead of taken.
+        """
+        if len(self._jump_chords) == 0:
+            return np.full(len(k), self.K - 1)
+        idx = np.searchsorted(self._jump_chords, k + 1)
+        has_next = idx < len(self._jump_chords)
+        return np.where(has_next, self._jump_chords[np.minimum(idx, len(self._jump_chords) - 1)], self.K - 1)
+
     def reset(self) -> None:
         _, _, probabilities = self.motion.initial_state()
-        self.init_modes = probabilities
-        self.k = np.zeros(0, dtype=np.int64)
-        self.a = np.zeros(0, dtype=np.int64)
-        self.r = np.zeros(0, dtype=np.int64)
-        self.p = np.zeros(0)
-        self.x = np.zeros((0, 3, 2))
-        self.P = np.zeros((0, 3, 2, 2))
-        self.w = np.zeros((0, 3))
-        # before the first chord the performance rests: this mass is heard as a rest
-        # and enters the first chord with the hold hazard, so sound before the music
-        # (room noise, a breath) is not taken for its first chord
-        self.waiting = 1.0
+        self.k = np.zeros(1, dtype=np.int64)
+        self.a = np.ones(1, dtype=np.int64)
+        self.r = np.zeros(1, dtype=np.int64)
+        self.p = np.ones(1)
+        self.x = np.zeros((1, 3, 2))
+        self.x[:, :, 0] = self.init_tempo
+        self.P = np.zeros((1, 3, 2, 2))
+        self.P[:, :, 0, 0] = self.init_tempo_var
+        self.w = probabilities[None, :].copy()
         self.input_index = 0
         self.current_index = 0
+        self._music_started = False
         self.current_route: Tuple[str, ...] = ()
         self._position = float(self.onset_beats[0])
         self._alignment_path = []
@@ -228,19 +234,19 @@ class IMMGraphFollower(OnlineAlignment):
         eta = (self.sigma_eta_scale * l * x[:, :, 0]) ** 2
         Q = np.zeros_like(P)
         Q[:, :, 0, 0] = eta
-        # CA is the tempo-change mode: Wiener acceleration of tempo in score time,
-        # scaled so tempo can change by tempo_drift over one whole note
-        # (Var(dtau over T) = q T^3 / 3 at T = 1)
-        q = 3 * (self.tempo_drift * x[:, CA, 0]) ** 2
-        s = length
-        Q[:, CA] = q[:, None, None] * np.stack(
-            [np.stack([s**3 / 3, s**2 / 2], -1),
-             np.stack([s**2 / 2, s], -1)], -2)
+        Q[:, CA] = eta[:, CA, None, None] * np.stack(
+            [np.stack([l[:, 0] ** 2 / 3, l[:, 0] / 2], -1),
+             np.stack([l[:, 0] / 2, np.ones(len(x))], -1)], -2)
         x = np.einsum("hmij,hmj->hmi", F, x)
         P = np.einsum("hmij,hmjk,hmlk->hmil", F, P, F) + Q
         return x, P
 
     def step(self, features: np.ndarray) -> None:
+        feature = np.abs(np.asarray(features, dtype=float)).reshape(-1)
+        if not self._music_started:
+            if feature.max() < SILENCE_PEAKINESS * (feature.mean() + 1e-10):
+                return
+            self._music_started = True
         log_frames = self._log_frame_likelihoods(features)
         c, x, P = self._mix()
         length = self.lengths[self.k]
@@ -258,9 +264,7 @@ class IMMGraphFollower(OnlineAlignment):
                 held = self._heard(log_frames, self.last_frame[self.k])
                 log_stay[:, ZV] = np.logaddexp(held, log_frames[-1]) - np.log(2.0)
             log_onset = self._heard(log_frames, self.onset_frame)
-        scale = max(log_stay.max(initial=-np.inf), log_onset[np.minimum(self.k + 1, self.K - 1)].max(initial=-np.inf))
-        if self.waiting > 0:
-            scale = max(scale, self.log_silence, log_onset[0])
+        scale = max(log_stay.max(), log_onset[np.minimum(self.k + 1, self.K - 1)].max())
         acoustic = np.exp(log_stay - scale)
         onset_liks = np.exp(log_onset - scale)
 
@@ -283,7 +287,6 @@ class IMMGraphFollower(OnlineAlignment):
 
         advance = c * (1.0 - stay_m)
         parent = np.flatnonzero(can_advance & (advance.sum(axis=1) > 0))
-        target = self.k[parent] + 1
         share = np.ones(len(parent))
         route = self.r[parent].copy()
         extra = []
@@ -292,13 +295,84 @@ class IMMGraphFollower(OnlineAlignment):
             share[n] = linear
             for t, jump_share, key in targets:
                 extra.append((parent[n], t, jump_share, self._route_id((*self.routes[route[n]], key))))
+
+        # The duration hazard generalizes to a multi-chord span through its cumulative
+        # nominal length alone, so a hypothesis stuck on an acoustically ambiguous run
+        # of very short chords can land several chords ahead in one frame instead of
+        # only ever advancing by one. Where that lands is estimated the same way the
+        # score-following literature estimates any point position from elapsed time and
+        # tempo: divide elapsed time by tempo for the expected chord reached, and widen
+        # by a standard Gaussian confidence gate (GATE_SIGMAS) scaled by the tempo
+        # estimate's own relative uncertainty, which is what actually keeps growing this
+        # far out, rather than searching outward until a probability decays to some
+        # floor -- a tempo estimate's relative uncertainty does not vanish with distance,
+        # so that cumulative "not finished yet" probability can plateau above any fixed
+        # floor instead of ever reaching it. The range never crosses a chord with an
+        # outgoing structural jump, which must still be visited unskipped to fire, and
+        # never exceeds max_hypotheses candidates, the beam's own capacity.
+        # Landing weight also carries the emission of every chord it skips past against
+        # the current frame, exactly as if each were separately checked: a span whose
+        # skipped chords do not even resemble what is currently heard is disfavoured
+        # the same way a single low-likelihood advance already is.
+        # ZV's hazard is a memoryless per-beat sojourn, independent of chord length, so
+        # it never has grounds to skip and must not be the reason the range below grows.
+        GATE_SIGMAS = 3.0
+        skippable = self.motion.enabled.copy()
+        skippable[ZV] = False
+        k0 = self.k[parent]
+        M = 1
+        if len(parent) and self.duration_model == "legacy" and skippable.any():
+            xp, Pp, ap = x[parent], P[parent], self.a[parent]
+            boundary = self._skip_boundary(k0)
+            cp = c[parent][:, skippable]
+            cp = cp / np.maximum(cp.sum(axis=1, keepdims=True), PROB_FLOOR)
+            tempo_hat = np.maximum(np.einsum("hm,hm->h", cp, xp[:, skippable, 0]), PROB_FLOOR)
+            relative_std = np.sqrt(np.einsum("hm,hm->h", cp, Pp[:, skippable, 0, 0])) / tempo_hat
+            elapsed_length = self._cumsum_lengths[k0] + ap * self.delta / tempo_hat
+            m_star = np.clip(np.searchsorted(self._cumsum_lengths, elapsed_length) - k0, 1, None)
+            reach = np.nan_to_num(np.ceil(m_star * (1.0 + GATE_SIGMAS * relative_std)), nan=1.0)
+            M = int(np.clip(np.minimum(reach, boundary - k0).max(), 1, min(self.K, self.max_hypotheses)))
+
+        if M == 1:
+            mode_advance = advance[parent]
+            landing_length = length[parent]
+            target = k0 + 1
+        else:
+            ms = np.arange(1, M + 1)
+            S = np.stack([self._survival(self._cumlen(k0, m), xp, Pp, ap) for m in range(1, M + 2)])
+            # a disabled mode's zero-variance survival is 0/0 = nan; it carries no mass
+            # (advance is already 0 there), so it must not poison the shared normalization
+            exact = np.nan_to_num(np.clip(S[1:] - S[:-1], 0.0, None))    # landing exactly m chords on
+            absorb = np.nan_to_num(np.clip(1.0 - S[:-1], 0.0, None))    # at least m, when m is as far as reachable
+            max_m = np.clip(boundary - k0, 1, M)
+            is_last = ms[:, None] == max_m[None, :]
+            zone = np.where(is_last[:, :, None], absorb, exact) * (ms[:, None, None] <= max_m[None, :, None])
+            if self.motion.enabled[ZV]:
+                zone[:, :, ZV] = 0.0
+                zone[0, :, ZV] = 1.0
+            onset_cumsum = np.concatenate([[0.0], np.cumsum(log_onset[: self.K])])
+            skip_idx = np.minimum(k0[None, :] + ms[:, None], self.K)
+            skipped = onset_cumsum[skip_idx] - onset_cumsum[np.minimum(k0[None, :] + 1, self.K)]
+            weight = np.nan_to_num(zone * np.exp(skipped - skipped.max(axis=0, keepdims=True))[:, :, None])
+            frac = weight / np.maximum(weight.sum(axis=0, keepdims=True), PROB_FLOOR)
+            mode_advance = (advance[parent] * frac).reshape(-1, 3)
+            landing_length = self._cumlen(k0, ms[:, None]).reshape(-1)
+            target = (k0[None, :] + ms[:, None]).reshape(-1)
+            parent = np.tile(parent, M)
+            share = np.tile(share, M)
+            route = np.tile(route, M)
+
         if extra:
             e = np.array(extra, dtype=object)
-            parent = np.r_[parent, e[:, 0].astype(int)]
+            j_parent = e[:, 0].astype(int)
+            parent = np.r_[parent, j_parent]
             target = np.r_[target, e[:, 1].astype(int)]
             share = np.r_[share, e[:, 2].astype(float)]
             route = np.r_[route, e[:, 3].astype(int)]
-        xa, Pa = self._advance(x[parent], P[parent], length[parent], self.a[parent] * self.delta)
+            mode_advance = np.concatenate([mode_advance, advance[j_parent]])
+            landing_length = np.r_[landing_length, length[j_parent]]
+
+        xa, Pa = self._advance(x[parent], P[parent], landing_length, self.a[parent] * self.delta)
         landing = np.minimum(target, self.K - 1)
         changed = self.marked_tempo[self.k[parent]] != self.marked_tempo[landing]
         Pa[changed, :, 0, 0] = xa[changed, :, 0] ** 2
@@ -306,26 +380,11 @@ class IMMGraphFollower(OnlineAlignment):
         target = np.where(ended, self.k[parent], target)
         age = np.where(ended, self.a[parent] + 1, 1)
         rows.append((np.stack([target, age, route], 1),
-                     (self.p[parent] * share * onset_liks[target])[:, None] * advance[parent], xa, Pa))
-
-        if self.waiting > 0:
-            hold = np.exp(-self.delta / self.motion.beat_seconds)
-            x0 = np.zeros((1, 3, 2))
-            x0[:, :, 0] = self.init_tempo
-            P0 = np.zeros((1, 3, 2, 2))
-            P0[:, :, 0, 0] = self.init_tempo_var
-            rows.append((np.array([[0, 1, 0]]),
-                         self.waiting * (1.0 - hold) * onset_liks[0] * self.init_modes[None, :], x0, P0))
-            self.waiting *= hold * np.exp(self.log_silence - scale)
+                     (self.p[parent] * share * onset_liks[target])[:, None] * mode_advance, xa, Pa))
 
         key, u, x, P = (np.concatenate(parts) for parts in zip(*rows))
         prob = u.sum(axis=1)
-        # mass below PROB_FLOOR relative to the leader is numerically zero: moment
-        # matching on subnormal weights returns meaningless (indefinite) covariances
-        leader = max(prob.max(), self.waiting)
-        live = prob > PROB_FLOOR * leader
-        if self.waiting <= PROB_FLOOR * leader:
-            self.waiting = 0.0
+        live = prob > 0
         key, u, x, P, prob = key[live], u[live], x[live], P[live], prob[live]
 
         key, inverse = np.unique(key, axis=0, return_inverse=True)
@@ -335,9 +394,8 @@ class IMMGraphFollower(OnlineAlignment):
         np.add.at(p_sum, inverse, prob)
         w_sum = np.zeros((m, 3))
         np.add.at(w_sum, inverse, u)
-        has_mass = w_sum > PROB_FLOOR * p_sum[:, None]
-        weight = np.where(has_mass[inverse], u, prob[:, None])
-        mass = np.where(has_mass, w_sum, p_sum[:, None])
+        weight = np.where(w_sum[inverse] > 0, u, prob[:, None])
+        mass = np.where(w_sum > 0, w_sum, p_sum[:, None])
         w = w_sum / p_sum[:, None]
         x_sum = np.zeros((m, 3, 2))
         np.add.at(x_sum, inverse, weight[:, :, None] * x)
@@ -348,24 +406,15 @@ class IMMGraphFollower(OnlineAlignment):
 
         keep = np.argsort(p_sum)[::-1][: self.max_hypotheses]
         self.k, self.a, self.r = key[keep, 0], key[keep, 1], key[keep, 2]
-        total = p_sum[keep].sum() + self.waiting
-        self.p = p_sum[keep] / total
-        self.waiting /= total
-        if 0 < self.waiting < 0.5:
-            # the music has more likely started than not: commit to it, so that
-            # music the chroma model explains poorly is not re-read as silence
-            self.p /= self.p.sum()
-            self.waiting = 0.0
+        self.p = p_sum[keep] / p_sum[keep].sum()
         self.x, self.P, self.w = x[keep], P[keep], w[keep]
 
         if self.position_estimator == "mean":
-            position, route = estimate_chord_position(
+            self._position, route = estimate_chord_position(
                 self.onset_beats, self.lengths, self.k, self.a, self.r,
                 self.p, self.w, self.x[:, :, 0], self.delta,
                 hold_mode=ZV if self.motion.enabled[ZV] else None,
             )
-            started = 1.0 - self.waiting
-            self._position = started * position + self.waiting * float(self.onset_beats[0])
             self.current_route = self.routes[route]
             self.current_index = int(np.clip(
                 np.searchsorted(self.onset_beats, self._position, side="right") - 1,
@@ -377,10 +426,6 @@ class IMMGraphFollower(OnlineAlignment):
         chord_p = np.zeros(self.K)
         np.add.at(chord_p, self.k, self.p)
         best = int(np.argmax(chord_p))
-        if self.waiting >= chord_p[best]:
-            self.current_index, self._position = 0, float(self.onset_beats[0])
-            self.input_index += 1
-            return
         sel = self.k == best
         pb = self.p[sel] / chord_p[best]
         age = pb @ self.a[sel]

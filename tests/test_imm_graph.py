@@ -57,13 +57,11 @@ def test_chord_jumps_map_repeat_to_first_chord_of_target():
 def test_repeat_jump_splits_advance_by_graph_prior(monkeypatch):
     follower = _follower(_repeat_part(), modes=("cv",))
     monkeypatch.setattr(follower, "_log_frame_likelihoods", lambda features: np.zeros(len(follower.log_reference) + 1))
-    follower.step(_chroma(0))  # enter the first chord, then place its hypothesis at the measure end
-    follower.waiting = 0.0
-    follower.k, follower.a, follower.r = follower.k[:1] * 0 + 7, follower.a[:1] * 0 + 10_000, follower.r[:1]
-    follower.p, follower.x, follower.P, follower.w = np.ones(1), follower.x[:1], follower.P[:1], follower.w[:1]
+    follower.k[:] = 7
+    follower.a[:] = 10_000
     follower.step(_chroma(0))
-    chords = dict(zip(follower.k.tolist(), follower.p.tolist()))
-    assert chords[0] == pytest.approx(chords[8])
+    # an overdue hypothesis may skip ahead on the linear path; the graph prior splits the mass
+    assert follower.p[follower.k == 0].sum() == pytest.approx(follower.p[follower.k > 7].sum())
     jumped = follower.r[follower.k == 0][0]
     assert follower.routes[jumped] == ("measure:1:2->measure:0:1",)
 
@@ -89,8 +87,7 @@ def test_silence_before_the_music_starts_is_ignored():
     for _ in range(400):  # 13 s of flat (silent) chroma against one-beat chords
         follower.step(np.full(12, 1 / 12, dtype=np.float32))
     assert follower.current_index == 0
-    assert follower.waiting > 0.5
-    assert follower.get_current_position() == pytest.approx(follower.onset_beats[0], abs=0.5)
+    assert follower.input_index == 0
 
 
 def test_held_chord_stays_while_its_sound_continues():
@@ -100,7 +97,6 @@ def test_held_chord_stays_while_its_sound_continues():
     with_hold = _follower(part)
     without_hold = _follower(part, modes=("cv", "ca"))
     for follower in (with_hold, without_hold):
-        follower.log_rest = np.full((1, 12), -np.log(12.0))  # a rendered rest is silence, not the held pitch
         for _ in range(400):
             follower.step(_chroma(0))
     assert with_hold.current_index == 0
