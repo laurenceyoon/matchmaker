@@ -20,7 +20,6 @@ import partitura as pt
 from scipy.special import logsumexp, ndtr
 
 from matchmaker.base import OnlineAlignment
-from matchmaker.dp.oltw_soft import SILENCE_PEAKINESS
 from matchmaker.features.audio import FRAME_RATE
 from matchmaker.graph.score_graph import EdgeKind, ScoreGraph
 from matchmaker.io.audio import QUEUE_TIMEOUT
@@ -148,19 +147,20 @@ class IMMGraphFollower(OnlineAlignment):
 
     def reset(self) -> None:
         _, _, probabilities = self.motion.initial_state()
-        self.k = np.zeros(1, dtype=np.int64)
-        self.a = np.ones(1, dtype=np.int64)
-        self.r = np.zeros(1, dtype=np.int64)
-        self.p = np.ones(1)
-        self.x = np.zeros((1, 3, 2))
-        self.x[:, :, 0] = self.init_tempo
-        self.P = np.zeros((1, 3, 2, 2))
-        self.P[:, :, 0, 0] = self.init_tempo_var
-        self.w = probabilities[None, :].copy()
+        self.init_modes = probabilities
+        self.k = np.zeros(0, dtype=np.int64)
+        self.a = np.zeros(0, dtype=np.int64)
+        self.r = np.zeros(0, dtype=np.int64)
+        self.p = np.zeros(0)
+        self.x = np.zeros((0, 3, 2))
+        self.P = np.zeros((0, 3, 2, 2))
+        self.w = np.zeros((0, 3))
+        # before the first chord the performance rests: this mass is heard as a rest
+        # and enters the first chord with the hold hazard, so sound before the music
+        # (room noise, a breath) is not taken for its first chord
+        self.waiting = 1.0
         self.input_index = 0
         self.current_index = 0
-        self._music_started = False
-        self._peaky_streak = 0
         self.current_route: Tuple[str, ...] = ()
         self._position = float(self.onset_beats[0])
         self._alignment_path = []
@@ -239,17 +239,6 @@ class IMMGraphFollower(OnlineAlignment):
         return x, P
 
     def step(self, features: np.ndarray) -> None:
-        feature = np.abs(np.asarray(features, dtype=float)).reshape(-1)
-        if not self._music_started:
-            # A single peaky frame is not enough: an isolated transient (a
-            # click, a breath, a mic bump) can look as peaky as a real onset
-            # for one frame. Two in a row rules out a one-frame glitch without
-            # delaying a real, sustained onset by more than a frame.
-            peaky = feature.max() >= SILENCE_PEAKINESS * (feature.mean() + 1e-10)
-            self._peaky_streak = self._peaky_streak + 1 if peaky else 0
-            if self._peaky_streak < 2:
-                return
-            self._music_started = True
         log_frames = self._log_frame_likelihoods(features)
         c, x, P = self._mix()
         length = self.lengths[self.k]
@@ -267,7 +256,9 @@ class IMMGraphFollower(OnlineAlignment):
                 held = self._heard(log_frames, self.last_frame[self.k])
                 log_stay[:, ZV] = np.logaddexp(held, log_frames[-1]) - np.log(2.0)
             log_onset = self._heard(log_frames, self.onset_frame)
-        scale = max(log_stay.max(), log_onset[np.minimum(self.k + 1, self.K - 1)].max())
+        scale = max(log_stay.max(initial=-np.inf), log_onset[np.minimum(self.k + 1, self.K - 1)].max(initial=-np.inf))
+        if self.waiting > 0:
+            scale = max(scale, log_frames[-1], log_onset[0])
         acoustic = np.exp(log_stay - scale)
         onset_liks = np.exp(log_onset - scale)
 
@@ -315,11 +306,24 @@ class IMMGraphFollower(OnlineAlignment):
         rows.append((np.stack([target, age, route], 1),
                      (self.p[parent] * share * onset_liks[target])[:, None] * advance[parent], xa, Pa))
 
+        if self.waiting > 0:
+            hold = np.exp(-self.delta / self.motion.beat_seconds)
+            x0 = np.zeros((1, 3, 2))
+            x0[:, :, 0] = self.init_tempo
+            P0 = np.zeros((1, 3, 2, 2))
+            P0[:, :, 0, 0] = self.init_tempo_var
+            rows.append((np.array([[0, 1, 0]]),
+                         self.waiting * (1.0 - hold) * onset_liks[0] * self.init_modes[None, :], x0, P0))
+            self.waiting *= hold * np.exp(log_frames[-1] - scale)
+
         key, u, x, P = (np.concatenate(parts) for parts in zip(*rows))
         prob = u.sum(axis=1)
         # mass below PROB_FLOOR relative to the leader is numerically zero: moment
         # matching on subnormal weights returns meaningless (indefinite) covariances
-        live = prob > PROB_FLOOR * prob.max()
+        leader = max(prob.max(), self.waiting)
+        live = prob > PROB_FLOOR * leader
+        if self.waiting <= PROB_FLOOR * leader:
+            self.waiting = 0.0
         key, u, x, P, prob = key[live], u[live], x[live], P[live], prob[live]
 
         key, inverse = np.unique(key, axis=0, return_inverse=True)
@@ -342,15 +346,19 @@ class IMMGraphFollower(OnlineAlignment):
 
         keep = np.argsort(p_sum)[::-1][: self.max_hypotheses]
         self.k, self.a, self.r = key[keep, 0], key[keep, 1], key[keep, 2]
-        self.p = p_sum[keep] / p_sum[keep].sum()
+        total = p_sum[keep].sum() + self.waiting
+        self.p = p_sum[keep] / total
+        self.waiting /= total
         self.x, self.P, self.w = x[keep], P[keep], w[keep]
 
         if self.position_estimator == "mean":
-            self._position, route = estimate_chord_position(
+            position, route = estimate_chord_position(
                 self.onset_beats, self.lengths, self.k, self.a, self.r,
                 self.p, self.w, self.x[:, :, 0], self.delta,
                 hold_mode=ZV if self.motion.enabled[ZV] else None,
             )
+            started = 1.0 - self.waiting
+            self._position = started * position + self.waiting * float(self.onset_beats[0])
             self.current_route = self.routes[route]
             self.current_index = int(np.clip(
                 np.searchsorted(self.onset_beats, self._position, side="right") - 1,
@@ -362,6 +370,10 @@ class IMMGraphFollower(OnlineAlignment):
         chord_p = np.zeros(self.K)
         np.add.at(chord_p, self.k, self.p)
         best = int(np.argmax(chord_p))
+        if self.waiting >= chord_p[best]:
+            self.current_index, self._position = 0, float(self.onset_beats[0])
+            self.input_index += 1
+            return
         sel = self.k == best
         pb = self.p[sel] / chord_p[best]
         age = pb @ self.a[sel]

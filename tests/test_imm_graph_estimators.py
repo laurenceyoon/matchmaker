@@ -33,7 +33,7 @@ def test_score_time_model_keeps_a_finite_normalized_posterior(estimator):
     for feature in sf.reference_features:
         sf.step(feature)
         assert np.isfinite(sf.get_current_position())
-        assert sf.p.sum() == pytest.approx(1)
+        assert sf.p.sum() + sf.waiting == pytest.approx(1)
         np.testing.assert_allclose(sf.w.sum(axis=1), 1)
         assert np.all(np.isfinite(sf.x))
         assert np.min(np.linalg.eigvalsh(sf.P)) >= -1e-10
