@@ -50,6 +50,10 @@ processors:
       class: matchmaker.features.audio:ChromagramProcessor
       args: *audio_base
 
+    chroma_onset:
+      class: matchmaker.features.audio:ChromaOnsetProcessor
+      args: *audio_base
+
     mfcc:
       class: matchmaker.features.audio:MFCCProcessor
       args: *audio_base

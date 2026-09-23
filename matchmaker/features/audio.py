@@ -61,6 +61,29 @@ class ChromagramProcessor(Processor):
         return chroma.T, f_time
 
 
+class ChromaOnsetProcessor(ChromagramProcessor):
+    """Chroma plus one onset-strength column: the rectified spectral flux relative to
+    the frame's spectral magnitude, which is scale-free and so needs no loudness
+    calibration. Chroma normalises away the attack a new chord makes; this keeps it.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.previous = None
+
+    def __call__(self, data: InputAudioFrame) -> Optional[np.ndarray]:
+        chroma, f_time = super().__call__(data)
+        y = data[0]
+        magnitude = np.abs(librosa.stft(y, n_fft=self.n_fft, hop_length=self.hop_length, center=False)).T
+        previous = np.vstack([magnitude[:1] if self.previous is None else self.previous, magnitude[:-1]])
+        self.previous = magnitude[-1:]
+        flux = np.maximum(magnitude - previous, 0).sum(1) / (magnitude.sum(1) + 1e-9)
+        return np.hstack([chroma, flux[:, None].astype(np.float32)]), f_time
+
+    def reset(self):
+        self.previous = None
+
+
 class MFCCProcessor(Processor):
     def __init__(
         self,
