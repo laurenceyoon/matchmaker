@@ -255,6 +255,17 @@ methods:
         tempo: {from: tempo}
       config_passthrough: true
 
+    imm_chord:
+      class: matchmaker.prob.imm_chord:IMMChordFollower
+      reference: score_audio
+      args:
+        <<: *oltw_frame_args
+        note_array: {from: note_array}
+        score_graph: {from: score_graph}
+        score_part: {from: score_part}
+        tempo: {from: tempo}
+      config_passthrough: true
+
     pfkorz:
       class: matchmaker.prob.particle_filter_korzeniowski:ParticleFilterKorzeniowski
       reference: korzeniowski_score_model
