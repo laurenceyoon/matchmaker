@@ -95,6 +95,8 @@ class IMMGraphFollower(OnlineAlignment):
         onset_frame = np.clip(np.searchsorted(beats, self.onset_beats), 0, len(beats) - 1)
         self.onset_frame = onset_frame
         self.last_frame = np.r_[np.maximum(onset_frame[1:] - 1, onset_frame[:-1]), len(beats) - 1]
+        # silence carries no pitch: its chroma is flat, a constant likelihood per frame
+        self.log_silence = -np.log(reference.shape[1])
         sounding = score_activity(score_part, beats, len(reference))
         self.log_rest = self.log_reference[~sounding] if not sounding.all() else np.full(
             (1, reference.shape[1]), -np.log(reference.shape[1])
@@ -258,7 +260,7 @@ class IMMGraphFollower(OnlineAlignment):
             log_onset = self._heard(log_frames, self.onset_frame)
         scale = max(log_stay.max(initial=-np.inf), log_onset[np.minimum(self.k + 1, self.K - 1)].max(initial=-np.inf))
         if self.waiting > 0:
-            scale = max(scale, log_frames[-1], log_onset[0])
+            scale = max(scale, self.log_silence, log_onset[0])
         acoustic = np.exp(log_stay - scale)
         onset_liks = np.exp(log_onset - scale)
 
@@ -314,7 +316,7 @@ class IMMGraphFollower(OnlineAlignment):
             P0[:, :, 0, 0] = self.init_tempo_var
             rows.append((np.array([[0, 1, 0]]),
                          self.waiting * (1.0 - hold) * onset_liks[0] * self.init_modes[None, :], x0, P0))
-            self.waiting *= hold * np.exp(log_frames[-1] - scale)
+            self.waiting *= hold * np.exp(self.log_silence - scale)
 
         key, u, x, P = (np.concatenate(parts) for parts in zip(*rows))
         prob = u.sum(axis=1)
@@ -349,6 +351,11 @@ class IMMGraphFollower(OnlineAlignment):
         total = p_sum[keep].sum() + self.waiting
         self.p = p_sum[keep] / total
         self.waiting /= total
+        if 0 < self.waiting < 0.5:
+            # the music has more likely started than not: commit to it, so that
+            # music the chroma model explains poorly is not re-read as silence
+            self.p /= self.p.sum()
+            self.waiting = 0.0
         self.x, self.P, self.w = x[keep], P[keep], w[keep]
 
         if self.position_estimator == "mean":
