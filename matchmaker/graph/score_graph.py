@@ -16,8 +16,6 @@ class EdgeKind(str, Enum):
     CODA = "coda"
     DAL_SEGNO = "dal-segno"
     DA_CAPO = "da-capo"
-    SKIP = "skip"
-    MANUAL = "manual"
 
 
 @dataclass(frozen=True)
@@ -68,14 +66,6 @@ class ScoreGraph:
         total = sum(e.prior for e in edges)
         return tuple((e, e.prior / total) for e in edges)
 
-    @classmethod
-    def linear(cls, beats: Iterable[float]) -> ScoreGraph:
-        nodes = [ScoreNode(f"beat:{i}", b) for i, b in enumerate(beats)]
-        graph = cls(nodes)
-        for left, right in zip(nodes, nodes[1:]):
-            graph.add_edge(ScoreEdge(left.node_id, right.node_id))
-        return graph
-
 
 class ScoreDirectedGraph(ScoreGraph):
     def __init__(
@@ -85,10 +75,6 @@ class ScoreDirectedGraph(ScoreGraph):
     ) -> None:
         super().__init__(nodes)
         self.measure_nodes = tuple(measure_nodes)
-
-    @property
-    def graph(self) -> ScoreDirectedGraph:
-        return self
 
 
 class ScoreDirectedGraphBuilder:
@@ -218,34 +204,3 @@ class ScoreDirectedGraphBuilder:
             graph.add_edge(ScoreEdge(last_node, last_node, EdgeKind.STAY, self.linear_prior))
 
         return graph
-
-    parse = build
-
-
-def rebase_measure_beats(
-    graph: ScoreDirectedGraph,
-    measure_start_beats: list[float] | tuple[float, ...],
-    *,
-    final_beat: float | None = None,
-) -> ScoreDirectedGraph:
-    starts = tuple(float(b) for b in measure_start_beats)
-    new_graph = ScoreDirectedGraph(measure_nodes=graph.measure_nodes)
-    for i, nid in enumerate(graph.measure_nodes):
-        old = graph.nodes[nid]
-        dur = (
-            (starts[i + 1] - starts[i])
-            if i + 1 < len(starts)
-            else (
-                (final_beat - starts[i])
-                if final_beat is not None
-                else float(old.metadata.get("duration_beats", 0.0))
-            )
-        )
-        meta = dict(old.metadata, duration_beats=dur)
-        new_graph.add_node(
-            ScoreNode(old.node_id, starts[i], old.measure, old.event_ids, metadata=meta)
-        )
-    for nid in graph.measure_nodes:
-        for edge in graph.outgoing(nid):
-            new_graph.add_edge(edge)
-    return new_graph

@@ -19,7 +19,4 @@ from .oltw_dixon import (
     OnlineTimeWarpingDixonEvent,
     OnlineTimeWarpingDixonFrame,
 )
-from .oltw_soft import SoftOnlineTimeWarping
-from .oltw_hierarchical import HierarchicalSoftOnlineTimeWarping
 from .oltw_arzt_multi_fold import OnlineTimeWarpingArztMultiFold
-

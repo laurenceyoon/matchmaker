@@ -200,7 +200,6 @@ methods:
         selection_window: 50
         switch_margin: 0.05
 
-
     dixon:
       family: oltw
       class: matchmaker.dp:OnlineTimeWarpingDixonFrame
@@ -211,32 +210,6 @@ methods:
         processor: lse
         window_size: 10
         frame_rate: 50
-
-    soft_oltw:
-      class: matchmaker.dp:SoftOnlineTimeWarping
-      reference: score_audio
-      args:
-        <<: *oltw_frame_args
-        score_part: {from: score_part}
-        tempo: {from: tempo}
-      config_passthrough: true
-      default_kwargs:
-        window_size: 10
-        step_size: 3
-
-    hierarchical_soft_oltw:
-      class: matchmaker.dp:HierarchicalSoftOnlineTimeWarping
-      reference: score_audio
-      args:
-        <<: *oltw_frame_args
-        score_part: {from: score_part}
-        score_graph: {from: score_graph}
-        tempo: {from: tempo}
-      config_passthrough: true
-      default_kwargs:
-        window_size: 10
-        step_size: 3
-        beam_size: 2
 
     outerhmm:
       class: matchmaker.prob:AudioOuterProductHMM
@@ -277,21 +250,6 @@ methods:
         score_part: {from: score_part}
         tempo: {from: tempo}
       config_passthrough: true
-
-    raphael_ssm:
-      class: matchmaker.prob.skf:SwitchingKalmanFilterFollower
-      args:
-        reference_features: {from: note_array}
-        queue: {from: queue}
-        tempo: {from: tempo}
-        sample_rate: {from: sample_rate}
-        n_fft: {config: n_fft, default: 512}
-        hop_length: {from: hop_length}
-      default_kwargs:
-        processor: raw_spectrum
-        sample_rate: 8000
-        hop_length: 128
-        n_fft: 512
 
     pfkorz:
       class: matchmaker.prob.particle_filter_korzeniowski:ParticleFilterKorzeniowski

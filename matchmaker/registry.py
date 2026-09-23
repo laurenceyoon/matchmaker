@@ -145,7 +145,7 @@ def _reference_sample_rate(mm) -> int:
 
 @provider("score_graph")
 def _score_graph(mm):
-    """Directed score graph for hierarchical score navigation."""
+    """Directed measure graph of the score's repeats and jumps."""
     from matchmaker.graph.score_graph import ScoreDirectedGraphBuilder
 
     return ScoreDirectedGraphBuilder().build(mm.score_part or mm.score_file)

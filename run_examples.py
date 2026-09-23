@@ -117,7 +117,7 @@ def main():
         "--method",
         type=str,
         default=None,
-        help="Score following method (e.g., soft_oltw, arzt, dixon, outerhmm)",
+        help="Score following method (e.g., imm_graph, arzt, dixon, outerhmm)",
     )
     parser.add_argument("--score", type=str, default=None, help="Path to custom score XML/MusicXML")
     parser.add_argument("--audio-file", type=str, default=None, help="Path to custom performance audio file")
@@ -151,7 +151,7 @@ def main():
     if args.method is not None:
         method = args.method
     else:
-        method = "pthmm" if input_mode == "midi" else "soft_oltw"
+        method = "pthmm" if input_mode == "midi" else "imm_graph"
 
     # Initialize matchmaker (simulation mode)
     try:

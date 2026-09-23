@@ -349,65 +349,16 @@ Default method: `"arzt"`
 | `"dixon"` | On-line time warping by Dixon (2005) |
 | `"outerhmm"` | Outer-product HMM score follower by Nakamura (2014) |
 | `"skf"` | Switching Kalman Filter with hidden tempo by Jiang and Raphael (2020) |
-| `"soft_oltw"` | Soft online time warping with an IMM for each alignment candidate |
-| `"hierarchical_soft_oltw"` | Local IMM followers over a directed measure graph |
+| `"arzt_tempo"` | On-line time warping by Arzt with a tempo model (Arzt and Widmer, 2010) |
+| `"arzt_multi_fold"` | Arzt OLTW tracking several unfolded score variants in parallel |
+| `"imm_graph"` | Chord-state switching Kalman follower with IMM tempo modes and a measure graph |
 
-`soft_oltw` runs `SoftOnlineTimeWarping`: each candidate alignment position has
-its own IMM states, covariances and mode probabilities. `hierarchical_soft_oltw`
-maintains local IMM followers over a directed measure graph.
-
-```mermaid
-classDiagram
-    OnlineAlignment <|-- SoftOnlineTimeWarping
-    OnlineAlignment <|-- HierarchicalSoftOnlineTimeWarping
-    HierarchicalSoftOnlineTimeWarping *-- GraphHypothesis
-    GraphHypothesis *-- SoftOnlineTimeWarping
-    HierarchicalSoftOnlineTimeWarping --> ScoreGraph
-    SoftOnlineTimeWarping *-- IMMPathFilter
-    IMMPathFilter *-- IMMMotionModels
-```
-
-- `SoftOnlineTimeWarping` directly inherits `OnlineAlignment` and handles
-  streaming, feature distances, search windows and frame-to-beat conversion
-  (`matchmaker/dp/oltw_soft.py`). It uses IMM path inference by default.
-- Its internal `IMMPathFilter` combines acoustic costs with motion likelihoods
-  and merges incoming path states (`matchmaker/dp/oltw_imm.py`).
-- `IMMMotionModels` defines constant-velocity, constant-acceleration and pause
-  dynamics, score-based pause gating and correlated observation noise
-  (`matchmaker/prob/imm.py`). It is a component, not a standalone score follower.
-- `GraphHypothesis` holds a graph location, weight, local follower and traversal
-  counts. Graph data and MusicXML construction are in
-  `matchmaker/graph/score_graph.py`.
-
-The acoustic DP recurrence is Python with a Numba-compiled default backend.
-To run the alignment with Python/NumPy distance and path calculations:
-
-```python
-mm = Matchmaker(
-    score_file=score_file,
-    performance_file=audio_file,
-    method="soft_oltw",
-    kwargs={"backend": "python"},
-)
-```
-
-The IMM path is NumPy in both backends. `backend="python"` avoids JIT and custom
-Cython distance calls in the follower; feature extraction and other package
-components keep their own dependencies. The accelerated default is retained for
-real-time execution.
-
-Tunable alignment settings are `window_size`, `step_size`, `gamma` and
-`w_horizontal`; IMM settings include `obs_var` and `imm_modes`. Input data,
-`frame_rate`, `tempo` and `queue` come from the pipeline. Manhattan distance,
-the 0.1-second starting window and tempo-weighting history constants are fixed.
-Paper ablations use options on the same method: `use_imm=False`, `gamma=0`,
-`correlated_observation=False`, or mode subsets via `imm_modes`. They do not
-introduce additional registered methods.
-
-`use_silence=True` enables experimental ZV handling of exactly zero audio
-features in both IMM methods. It holds position while retaining the tempo for
-resumption, but allows predicted motion through notated rests. It does not
-detect pauses with nonzero microphone background noise and is off by default.
+`imm_graph` (`matchmaker/prob/imm_graph.py`) follows a beam of chord-state
+hypotheses whose tempo is tracked by a constant-velocity / constant-acceleration /
+pause (CV/CA/ZV) IMM (`matchmaker/prob/imm.py`), and routes repeats, voltas and
+D.C./D.S./Coda jumps through a directed measure graph
+(`matchmaker/graph/score_graph.py`), so folded scores need no unfolding.
+Tempo-mode ablations use the `modes` option, e.g. `kwargs={"modes": ["cv", "zv"]}`.
 
 ### MIDI (`input_type="midi"`)
 

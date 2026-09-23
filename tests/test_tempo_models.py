@@ -193,7 +193,7 @@ class TestRaphaelSwitchingStateSpace(unittest.TestCase):
         self.assertGreater(mu_new_slow, 2.0)
 
     def test_registry_lookup(self):
-        spec = REGISTRY.method("audio", "raphael_ssm")
+        spec = REGISTRY.method("audio", "skf")
         self.assertEqual(spec.cls_path, "matchmaker.prob.skf:SwitchingKalmanFilterFollower")
 
 

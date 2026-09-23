@@ -17,19 +17,9 @@ def follower(**kwargs):
         ref_frame_to_beat=np.arange(36) / 15, note_array=notes, frame_rate=30, **kwargs)
 
 
-def test_readout_does_not_feed_back_into_inference():
-    a = follower(position_estimator="map")
-    b = follower(position_estimator="mean")
-    for feature in np.repeat(a.reference_features, 2, axis=0):
-        a.step(feature)
-        b.step(feature)
-        for field in ("k", "a", "r", "p", "x", "P", "w"):
-            np.testing.assert_array_equal(getattr(a, field), getattr(b, field))
-
-
-@pytest.mark.parametrize("estimator", ["map", "mean"])
-def test_score_time_model_keeps_a_finite_normalized_posterior(estimator):
-    sf = follower(position_estimator=estimator, duration_model="score_time")
+@pytest.mark.parametrize("modes", [("cv", "ca", "zv"), ("cv", "zv"), ("cv", "ca"), ("cv",)])
+def test_every_ablation_keeps_a_finite_normalized_posterior(modes):
+    sf = follower(modes=modes)
     for feature in sf.reference_features:
         sf.step(feature)
         assert np.isfinite(sf.get_current_position())
@@ -38,9 +28,3 @@ def test_score_time_model_keeps_a_finite_normalized_posterior(estimator):
         assert np.all(np.isfinite(sf.x))
         assert np.min(np.linalg.eigvalsh(sf.P)) >= -1e-10
     assert sf.get_current_position() > 1.5
-
-
-@pytest.mark.parametrize("kwargs", [{"position_estimator": "median"}, {"duration_model": "typo"}])
-def test_invalid_model_options_are_rejected(kwargs):
-    with pytest.raises(ValueError):
-        follower(**kwargs)
