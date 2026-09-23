@@ -146,3 +146,20 @@ def kalman_update(x: np.ndarray, P: np.ndarray, residual: np.ndarray, H: np.ndar
     IKH = np.eye(x.shape[-1]) - K[..., :, None] * H[..., None, :]
     P = np.einsum("...ab,...bc,...dc->...ad", IKH, P, IKH) + R[..., None, None] * K[..., :, None] * K[..., None, :]
     return x + K * residual[..., None], P
+
+
+def iterated_kalman_update(x, P, z, h, H, R, iterations: int = 5):
+    """Iterated EKF (Gauss-Newton to the posterior mode) for one scalar measurement z = h(x) + v,
+    Var(v) = R(x); the Jacobian and the noise are re-evaluated at each iterate.
+
+    x: (..., n); P: (..., n, n); z: (...); h, R: callables (...,n) -> (...); H: (...,n) -> (..., n).
+    """
+    xi = x
+    for _ in range(iterations):
+        Hi, Ri = H(xi), R(xi)
+        PH = np.einsum("...ab,...b->...a", P, Hi)
+        K = PH / (np.einsum("...a,...a->...", Hi, PH) + Ri)[..., None]
+        xi = x + K * (z - h(xi) - np.einsum("...a,...a->...", Hi, x - xi))[..., None]
+    IKH = np.eye(x.shape[-1]) - K[..., :, None] * Hi[..., None, :]
+    P = np.einsum("...ab,...bc,...dc->...ad", IKH, P, IKH) + Ri[..., None, None] * K[..., :, None] * K[..., None, :]
+    return xi, P

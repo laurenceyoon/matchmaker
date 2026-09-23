@@ -42,7 +42,7 @@ from matchmaker.graph.score_graph import EdgeKind, ScoreGraph
 from matchmaker.io.audio import QUEUE_TIMEOUT
 from matchmaker.io.queue import RECVQueue
 from matchmaker.prob.chord_position import estimate_chord_position
-from matchmaker.prob.imm import interact, kalman_update, score_activity
+from matchmaker.prob.imm import interact, iterated_kalman_update, kalman_update, score_activity
 from matchmaker.prob.skf import MAX_HYPOTHESES, PROB_FLOOR, build_chord_sequence
 from matchmaker.utils.misc import set_latency_stats
 
@@ -155,6 +155,8 @@ class IMMChordFollower(OnlineAlignment):
         self._steady_only[:, 0] = 1.0
         self.gated = fit.get("gated", True)
         self.shared = fit.get("shared", False)
+        self.log_duration = fit.get("log_duration", False)
+        self.measurement = fit.get("measurement", "log" if self.log_duration else "linear")
         self.hold_enabled = "zv" in modes
         self.max_hypotheses = max_hypotheses
         self.delta = 1.0 / frame_rate
@@ -340,14 +342,30 @@ class IMMChordFollower(OnlineAlignment):
         says nothing about the tempo. Returns
         each dynamics mode's posterior and the posterior mode probabilities."""
         expected = length[:, None] * np.exp(x @ TEMPO)
-        H = expected[..., None] * TEMPO                                 # d(duration)/d(b, e)
-        R = self._duration_noise(expected)
-        residual = duration[:, None] - expected
-        x_play, P_play = kalman_update(x, P, residual, H, R)
+        if self.measurement == "iterated":
+            # d = l exp(b + e) plus timing noise whose duration-proportional part grows with d:
+            # iterate the linearisation (and the noise) to the posterior mode
+            h = lambda xi: length[:, None] * np.exp(xi @ TEMPO)
+            x_play, P_play = iterated_kalman_update(x, P, np.broadcast_to(duration[:, None], expected.shape), h,
+                                                    lambda xi: h(xi)[..., None] * TEMPO, lambda xi: self._duration_noise(h(xi)))
+            H, R, residual = expected[..., None] * TEMPO, self._duration_noise(expected), duration[:, None] - expected
+        elif self.log_duration:
+            # log d = log l + b + e is linear in the state: an exact Kalman update, with the
+            # timing noise carried to the log scale at the predicted duration
+            H = np.broadcast_to(TEMPO, x.shape)
+            R = self._duration_noise(expected) / expected ** 2
+            residual = np.log(duration[:, None] / expected)
+        else:
+            H = expected[..., None] * TEMPO                             # d(duration)/d(b, e)
+            R = self._duration_noise(expected)
+            residual = duration[:, None] - expected
+        if self.measurement != "iterated":
+            x_play, P_play = kalman_update(x, P, residual, H, R)
         played, held = end[:, :self.D, None], end[:, self.D:].reshape(len(end), BLOCKS - 1, self.D).sum(axis=1)[..., None]
         if self.robust_update:
-            tempo_var = expected ** 2 * np.einsum("a,hmab,b->hm", TEMPO, P, TEMPO)
-            S, S_wide = tempo_var + R, tempo_var + self.jitter ** 2 + (OUTLIER_SPREAD * expected) ** 2
+            scale = 1.0 if self.log_duration else expected ** 2
+            tempo_var = scale * np.einsum("a,hmab,b->hm", TEMPO, P, TEMPO)
+            S, S_wide = tempo_var + R, tempo_var + (self.jitter ** 2 + (OUTLIER_SPREAD * expected) ** 2) * scale / expected ** 2
             normal = (1 - OUTLIER_PRIOR) * np.exp(-0.5 * residual ** 2 / S) / np.sqrt(S)
             wide = OUTLIER_PRIOR * np.exp(-0.5 * residual ** 2 / S_wide) / np.sqrt(S_wide)
             outlier = (wide / np.maximum(normal + wide, PROB_FLOOR))[..., None]
