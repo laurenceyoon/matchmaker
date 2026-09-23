@@ -45,7 +45,7 @@ from matchmaker.prob.imm import interact, kalman_update, score_activity
 from matchmaker.prob.skf import MAX_HYPOTHESES, PROB_FLOOR, build_chord_sequence
 from matchmaker.utils.misc import set_latency_stats
 
-MODE_NAMES = ("steady", "rubato", "hold")
+MODE_NAMES = ("cv", "ca", "zv")
 N_CHROMA = 12
 SILENCE_PEAKINESS = 2.0
 
@@ -55,8 +55,11 @@ SILENCE_PEAKINESS = 2.0
 # validation split. JITTER in seconds, SPREAD relative to the duration, BASE_DRIFT the
 # variance of the base per whole note; per mode, REVERSION the deviation's reversion length
 # and RESIDENCE the mean stay (whole notes), DEVIATION its stationary variance.
-IMM_FIT = dict(jitter=0.04, spread=0.15, base_drift=1e-4, reversion=(0.5, 1.0), deviation=(0.001, 0.3),
-               residence=(16.0, 2.0))
+# CV keeps the deviation at zero; CA is a tempo change, the deviation drawn toward a faster
+# or slower target (accelerando, ritardando) with CV's variance, so no mode loosens the
+# prediction a wrong position hypothesis could exploit.
+IMM_FIT = dict(jitter=0.04, spread=0.2, base_drift=1e-4, reversion=(0.5, 0.5, 0.5), deviation=(0.03, 0.03, 0.03),
+               target=(0.0, -0.1, 0.1), residence=(32.0, 2.0, 2.0), gated=False)
 SINGLE_FIT = dict(jitter=0.04, spread=0.2, base_drift=1e-4, reversion=(0.5,), deviation=(0.03,), residence=(np.inf,))
 # a hypothesis may land several chords on within this many standard deviations of its
 # tempo estimate (the usual Gaussian validation gate)
@@ -94,21 +97,24 @@ class IMMChordFollower(OnlineAlignment):
         **kwargs,
     ):
         super().__init__(reference_features=reference_features, score_positions=score_positions, queue=queue)
-        if not set(modes) <= set(MODE_NAMES) or "steady" not in modes:
-            raise ValueError("modes must include 'steady' and be drawn from %s" % (MODE_NAMES,))
-        fit = fit or (IMM_FIT if "rubato" in modes else SINGLE_FIT)
+        if not set(modes) <= set(MODE_NAMES) or "cv" not in modes:
+            raise ValueError("modes must include 'cv' and be drawn from %s" % (MODE_NAMES,))
+        fit = fit or (IMM_FIT if "ca" in modes else SINGLE_FIT)
         self.jitter, self.spread, self.base_drift = fit["jitter"], fit["spread"], fit["base_drift"]
         self.reversion = np.array(fit["reversion"], dtype=float)
         self.deviation = np.array(fit["deviation"], dtype=float)
+        self.target = np.array(fit.get("target", np.zeros(len(self.reversion))), dtype=float)
         residence = np.array(fit["residence"], dtype=float)
         self.D = len(self.reversion)
         self.generator = (np.ones((self.D, self.D)) - self.D * np.eye(self.D)) / (residence[:, None] * max(self.D - 1, 1))
         self.stationary = residence / residence.sum() if np.isfinite(residence).all() else np.full(self.D, 1.0 / self.D)
-        self._prediction: Dict[float, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self._prediction: Dict[float, Tuple[np.ndarray, ...]] = {}
         # where a chord is too short to test the tempo, all mass moves to STEADY
         self._steady_only = np.zeros((self.D, self.D))
         self._steady_only[:, 0] = 1.0
-        self.hold_enabled = "hold" in modes
+        self.gated = fit.get("gated", True)
+        self.shared = fit.get("shared", False)
+        self.hold_enabled = "zv" in modes
         self.max_hypotheses = max_hypotheses
         self.delta = 1.0 / frame_rate
 
@@ -226,14 +232,17 @@ class IMMChordFollower(OnlineAlignment):
         return np.hstack([1.0 - ndtr(z), np.exp(-t / hold_mean)])
 
     def _prediction_model(self, length):
-        """Per-mode transition, state transition and process noise over `length` whole notes."""
+        """Per-mode transition, state transition, input and process noise over `length` whole
+        notes: the deviation reverts toward its mode's target."""
         if length not in self._prediction:
             phi = np.exp(-length / self.reversion)
             F = np.zeros((self.D, 2, 2))
             F[:, 0, 0], F[:, 1, 1] = 1.0, phi
+            B = np.zeros((self.D, 2))
+            B[:, 1] = (1 - phi) * self.target
             Q = np.zeros((self.D, 2, 2))
             Q[:, 0, 0], Q[:, 1, 1] = self.base_drift * length, self.deviation * (1 - phi ** 2)
-            self._prediction[length] = (expm(self.generator * length), F, Q)
+            self._prediction[length] = (expm(self.generator * length), F, B, Q)
         return self._prediction[length]
 
     def _skip_boundary(self, k):
@@ -297,12 +306,17 @@ class IMMChordFollower(OnlineAlignment):
         """IMM interaction over the modes available on the chord that starts, then each mode's
         prediction over its notated length."""
         models = [self._prediction_model(l) for l in length.tolist()]
-        transition, F, Q = (np.stack(parts) for parts in zip(*models))
-        expected = length * np.exp(np.einsum("hm,hm->h", mu, x @ TEMPO))
-        informative = expected >= self.jitter / self.spread
-        transition = np.where(informative[:, None, None], transition, self._steady_only)
+        transition, F, B, Q = (np.stack(parts) for parts in zip(*models))
+        if self.gated:
+            expected = length * np.exp(np.einsum("hm,hm->h", mu, x @ TEMPO))
+            informative = expected >= self.jitter / self.spread
+            transition = np.where(informative[:, None, None], transition, self._steady_only)
+        if self.shared:
+            # the rubato state belongs to the performer, not to a position hypothesis: every
+            # chord that starts takes the beam's mode posterior as its prior
+            mu = np.broadcast_to(self._beam_modes, mu.shape)
         c, x0, P0 = interact(mu, transition, x, P)
-        return np.einsum("hjab,hjb->hja", F, x0), np.einsum("hjab,hjbc,hjdc->hjad", F, P0, F) + Q, c
+        return np.einsum("hjab,hjb->hja", F, x0) + B, np.einsum("hjab,hjbc,hjdc->hjad", F, P0, F) + Q, c
 
     def step(self, features: np.ndarray) -> None:
         frame = np.asarray(features, dtype=float).reshape(-1, N_CHROMA + self.onset_evidence)[-1]
@@ -313,6 +327,8 @@ class IMMChordFollower(OnlineAlignment):
             self._music_started = True
         log_frames = self._log_frame_likelihoods(chroma)
         p = self.p
+        modes = self.w[:, :self.D] + self.w[:, self.D:]
+        self._beam_modes = self.p @ modes / max(self.p @ modes.sum(axis=1), PROB_FLOOR)
         if self.onset_evidence:
             # an attack shows in the frame after its onset: it confirms or refutes the
             # hypotheses that entered their chord in the previous frame (age 1)
