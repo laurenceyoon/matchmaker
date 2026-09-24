@@ -17,7 +17,7 @@ def _follower(part, onset=False, **kwargs):
                             note_array=notes, score_graph=ScoreDirectedGraphBuilder().build(part), score_part=part, **kwargs)
 
 
-@pytest.mark.parametrize("modes", [("cv",), ("cv", "zv"), ("cv", "ca", "zv")])
+@pytest.mark.parametrize("modes", [("cv",), ("cv", "zv"), ("cv", "ca", "zv"), ("cv", "ca", "zv", "jump")])
 @pytest.mark.parametrize("onset", [False, True])
 def test_follows_a_performance_through_the_repeat(modes, onset):
     part = _repeat_part()
