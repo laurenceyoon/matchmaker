@@ -125,6 +125,8 @@ class IMMChordFollower(OnlineAlignment):
         tempo: float = 120.0,
         max_hypotheses: int = MAX_HYPOTHESES,
         modes: Tuple[str, ...] = MODE_NAMES,
+        skip: bool = True,
+        robust_update: bool = True,
         **kwargs,
     ):
         super().__init__(reference_features=reference_features, score_positions=score_positions, queue=queue)
@@ -147,6 +149,9 @@ class IMMChordFollower(OnlineAlignment):
         self.jump = "jump" in modes
         self.max_hypotheses = max_hypotheses
         self.delta = 1.0 / frame_rate
+        # ablations: land one chord at a time; update the tempo by a linearised (EKF) duration
+        # in seconds, without the outlier weighting
+        self.skip, self.robust_update = skip, robust_update
 
         self.chords, self.lengths, self.onset_beats = build_chord_sequence(note_array)
         self.K = len(self.chords)
@@ -310,7 +315,7 @@ class IMMChordFollower(OnlineAlignment):
         elapsed = self._cumsum_lengths[k0] + self.a[parent] * self.delta / np.exp(u_hat)
         m_star = np.maximum(np.searchsorted(self._cumsum_lengths, elapsed) - k0, 1)
         reach = np.clip(np.minimum(np.ceil(m_star * (1 + GATE_SIGMAS * sd)), self._skip_boundary(k0) - k0),
-                        1, self.max_hypotheses).astype(int)
+                        1, self.max_hypotheses if self.skip else 1).astype(int)
         row = np.repeat(np.arange(len(parent)), reach)
         m = np.arange(len(row)) - np.repeat(np.cumsum(reach) - reach, reach) + 1
         span = lambda n: self._cumsum_lengths[np.minimum(k0[row] + n, self.K)] - self._cumsum_lengths[k0[row]]
@@ -333,16 +338,20 @@ class IMMChordFollower(OnlineAlignment):
         about the tempo, nor does an outlier duration. Returns each dynamics mode's posterior
         and the posterior mode probabilities."""
         expected = length[:, None] * np.exp(x @ TEMPO)
-        R = self._duration_noise(expected) / expected ** 2       # timing noise on the log scale
-        residual = np.log(duration[:, None] / expected)
-        x_play, P_play = kalman_update(x, P, residual, np.broadcast_to(TEMPO, x.shape), R)
         played, held = end[:, :self.D, None], end[:, self.D:, None]
-        tempo_var = np.einsum("a,hmab,b->hm", TEMPO, P, TEMPO)
-        S, S_wide = tempo_var + R, tempo_var + (JITTER / expected) ** 2 + OUTLIER_SPREAD ** 2
-        normal = (1 - OUTLIER_PRIOR) * np.exp(-0.5 * residual ** 2 / S) / np.sqrt(S)
-        wide = OUTLIER_PRIOR * np.exp(-0.5 * residual ** 2 / S_wide) / np.sqrt(S_wide)
-        outlier = (wide / np.maximum(normal + wide, PROB_FLOOR))[..., None]
-        played, held = played * (1 - outlier), held + played * outlier
+        if not self.robust_update:
+            x_play, P_play = kalman_update(x, P, duration[:, None] - expected, expected[..., None] * TEMPO,
+                                           self._duration_noise(expected))
+        else:
+            R = self._duration_noise(expected) / expected ** 2       # timing noise on the log scale
+            residual = np.log(duration[:, None] / expected)
+            x_play, P_play = kalman_update(x, P, residual, np.broadcast_to(TEMPO, x.shape), R)
+            tempo_var = np.einsum("a,hmab,b->hm", TEMPO, P, TEMPO)
+            S, S_wide = tempo_var + R, tempo_var + (JITTER / expected) ** 2 + OUTLIER_SPREAD ** 2
+            normal = (1 - OUTLIER_PRIOR) * np.exp(-0.5 * residual ** 2 / S) / np.sqrt(S)
+            wide = OUTLIER_PRIOR * np.exp(-0.5 * residual ** 2 / S_wide) / np.sqrt(S_wide)
+            outlier = (wide / np.maximum(normal + wide, PROB_FLOOR))[..., None]
+            played, held = played * (1 - outlier), held + played * outlier
         mass = np.maximum(played + held, PROB_FLOOR)
         x_end = (played * x_play + held * x) / mass
         d_play, d_hold = x_play - x_end, x - x_end

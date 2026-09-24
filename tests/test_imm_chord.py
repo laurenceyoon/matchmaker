@@ -46,3 +46,14 @@ def test_follows_a_performance_through_the_repeat(modes, onset):
 def test_rejects_unknown_modes():
     with pytest.raises(ValueError):
         _follower(_repeat_part(), modes=("steady",))
+
+
+@pytest.mark.parametrize("ablation", [dict(skip=False), dict(robust_update=False)])
+def test_ablations_still_follow(ablation):
+    part = _repeat_part()
+    follower = _follower(part, **ablation)
+    pitches = [p % 12 for p in _chord_pitches(part.note_array())]
+    for chord in list(range(8)) + list(range(12)):
+        for _ in range(FRAMES_PER_CHORD):
+            follower.step(_chroma(pitches[chord]))
+    assert abs(follower.current_index - 11) <= 1
