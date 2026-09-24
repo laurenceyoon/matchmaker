@@ -254,9 +254,11 @@ methods:
         score_part: {from: score_part}
         tempo: {from: tempo}
       config_passthrough: true
+      default_kwargs:
+        processor: chroma_onset
 
-    imm_chord:
-      class: matchmaker.prob.imm_chord:IMMChordFollower
+    imm_graph_v1:
+      class: matchmaker.prob.imm_graph_v1:IMMGraphFollowerV1
       reference: score_audio
       args:
         <<: *oltw_frame_args

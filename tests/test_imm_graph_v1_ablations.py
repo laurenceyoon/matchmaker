@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from matchmaker.prob.imm_graph import IMMGraphFollower
+from matchmaker.prob.imm_graph_v1 import IMMGraphFollowerV1 as IMMGraphFollower
 
 
 def follower(**kwargs):
