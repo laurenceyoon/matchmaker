@@ -48,7 +48,7 @@ def test_rejects_unknown_modes():
         _follower(_repeat_part(), modes=("steady",))
 
 
-@pytest.mark.parametrize("ablation", [dict(skip=False), dict(robust_update=False)])
+@pytest.mark.parametrize("ablation", [dict(skip=False), dict(robust_update=False), dict(tempo_tracking=False), dict(duration_model=False)])
 def test_ablations_still_follow(ablation):
     part = _repeat_part()
     follower = _follower(part, **ablation)

@@ -127,6 +127,8 @@ class IMMGraphFollower(OnlineAlignment):
         modes: Tuple[str, ...] = MODE_NAMES,
         skip: bool = True,
         robust_update: bool = True,
+        tempo_tracking: bool = True,
+        duration_model: bool = True,
         **kwargs,
     ):
         super().__init__(reference_features=reference_features, score_positions=score_positions, queue=queue)
@@ -152,6 +154,9 @@ class IMMGraphFollower(OnlineAlignment):
         # ablations: land one chord at a time; update the tempo by a linearised (EKF) duration
         # in seconds, without the outlier weighting
         self.skip, self.robust_update = skip, robust_update
+        # ablations: keep the tempo at its prior (no Kalman update); time chords by an
+        # exponential duration of the same mean (a first-order HMM) instead of the Gaussian one
+        self.tempo_tracking, self.duration_model = tempo_tracking, duration_model
 
         self.chords, self.lengths, self.onset_beats = build_chord_sequence(note_array)
         self.K = len(self.chords)
@@ -273,8 +278,9 @@ class IMMGraphFollower(OnlineAlignment):
         tempo_var = np.einsum("a,hmab,b->hm", TEMPO, P, TEMPO)
         t = age[:, None] * self.delta
         z = (t - expected) / np.sqrt(expected ** 2 * tempo_var + self._duration_noise(expected))
+        play = 1.0 - ndtr(z) if self.duration_model else np.exp(-t / expected)
         hold_mean = self.beat_seconds * tempo / self.marked_tempo     # one beat at the tempo
-        return np.hstack([1.0 - ndtr(z), np.exp(-t / hold_mean)])
+        return np.hstack([play, np.exp(-t / hold_mean)])
 
     def _prediction_model(self, length):
         """Mode transition, state transition, input and process noise over `length` whole
@@ -339,7 +345,9 @@ class IMMGraphFollower(OnlineAlignment):
         and the posterior mode probabilities."""
         expected = length[:, None] * np.exp(x @ TEMPO)
         played, held = end[:, :self.D, None], end[:, self.D:, None]
-        if not self.robust_update:
+        if not self.tempo_tracking:
+            x_play, P_play = x, P
+        elif not self.robust_update:
             x_play, P_play = kalman_update(x, P, duration[:, None] - expected, expected[..., None] * TEMPO,
                                            self._duration_noise(expected))
         else:
