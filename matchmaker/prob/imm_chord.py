@@ -156,6 +156,7 @@ class IMMChordFollower(OnlineAlignment):
         self.gated = fit.get("gated", True)
         self.shared = fit.get("shared", False)
         self.log_duration = fit.get("log_duration", False)
+        self.preroll = fit.get("preroll", False)
         self.measurement = fit.get("measurement", "log" if self.log_duration else "linear")
         self.hold_enabled = "zv" in modes
         self.max_hypotheses = max_hypotheses
@@ -228,17 +229,27 @@ class IMMChordFollower(OnlineAlignment):
         h, f = self.hold_prior[chord][:, None], self.free_prior[chord][:, None]
         return np.hstack([dynamics * (1 - h - f), dynamics * h, dynamics * f])
 
+    def _opening(self):
+        """Tempo state of a performance that starts: the marked tempo with its prior spread."""
+        x = np.zeros((1, self.D, 2))
+        x[..., 0] = np.log(self.marked_tempo) + TEMPO_PRIOR_MEAN
+        P = np.zeros((1, self.D, 2, 2))
+        P[..., 0, 0] = TEMPO_PRIOR_SD ** 2
+        P[..., 1, 1] = self.deviation
+        return x, P
+
     def reset(self) -> None:
-        self.k = np.zeros(1, dtype=np.int64)
-        self.a = np.ones(1, dtype=np.int64)
-        self.r = np.zeros(1, dtype=np.int64)
-        self.p = np.ones(1)
-        self.x = np.zeros((1, self.D, 2))
-        self.x[..., 0] = np.log(self.marked_tempo) + TEMPO_PRIOR_MEAN
-        self.P = np.zeros((1, self.D, 2, 2))
-        self.P[..., 0, 0] = TEMPO_PRIOR_SD ** 2
-        self.P[..., 1, 1] = self.deviation
+        n = 0 if self.preroll else 1
+        self.k = np.zeros(n, dtype=np.int64)
+        self.a = np.ones(n, dtype=np.int64)
+        self.r = np.zeros(n, dtype=np.int64)
+        self.p = np.ones(n)
+        self.x, self.P = (v[:n] for v in self._opening())
         self.w = self._chord_modes(self.stationary[None, :], self.k)
+        # before the first chord the performer rests: this mass hears silence as pitchless
+        # (flat) chroma and enters the first chord with the hold hazard, so room noise
+        # before the music is not timed as chords
+        self.waiting = 1.0 if self.preroll else 0.0
         self.input_index = 0
         self.current_index = 0
         self._music_started = False
@@ -397,10 +408,10 @@ class IMMChordFollower(OnlineAlignment):
     def step(self, features: np.ndarray) -> None:
         frame = np.asarray(features, dtype=float).reshape(-1, N_CHROMA + self.onset_evidence)[-1]
         chroma = frame[:N_CHROMA]
-        if not self._music_started:
+        if not self._music_started and not self.preroll:
             if np.abs(chroma).max() < SILENCE_PEAKINESS * (np.abs(chroma).mean() + 1e-10):
                 return
-            self._music_started = True
+        self._music_started = True
         log_frames = self._log_frame_likelihoods(chroma)
         p = self.p
         modes = self.w.reshape(len(self.w), BLOCKS, self.D).sum(axis=1)
@@ -420,7 +431,10 @@ class IMMChordFollower(OnlineAlignment):
         log_free = np.full(len(self.k), -np.log(N_CHROMA))   # expects no particular frame
         log_stay = np.hstack([log_play, np.repeat(log_hold[:, None], self.D, axis=1), np.repeat(log_free[:, None], self.D, axis=1)])
         log_onset = self._heard(log_frames, self.onset_frame)
-        scale = max(log_stay.max(), log_onset[np.minimum(self.k + 1, self.K - 1)].max())
+        scale = max(log_stay.max(initial=-np.inf), log_onset[np.minimum(self.k + 1, self.K - 1)].max(initial=-np.inf))
+        log_silence = -np.log(N_CHROMA)
+        if self.waiting > 0:
+            scale = max(scale, log_silence, log_onset[0])
         acoustic = np.exp(log_stay - scale)
         onset_liks = np.exp(log_onset - scale)
 
@@ -467,6 +481,14 @@ class IMMChordFollower(OnlineAlignment):
             rows.append((np.stack([landing, np.where(ended, self.a[parent[src]] + 1, 1), route], 1),
                          mass[:, None] * self._chord_modes(dyn, landing), x_land, P_land))
 
+        if self.waiting > 0:
+            hold = np.exp(-self.delta / self.beat_seconds)
+            x0, P0 = self._opening()
+            rows.append((np.array([[0, 1, 0]]),
+                         self.waiting * (1.0 - hold) * onset_liks[0] * self._chord_modes(self.stationary[None, :], np.zeros(1, dtype=np.int64)),
+                         x0, P0))
+            self.waiting *= hold * np.exp(log_silence - scale)
+
         key, w_rows, xx, PP = (np.concatenate(parts) for parts in zip(*rows))
         prob = w_rows.sum(axis=1)
         live = prob > 0
@@ -495,10 +517,18 @@ class IMMChordFollower(OnlineAlignment):
 
         keep = np.argsort(p_sum)[::-1][: self.max_hypotheses]
         self.k, self.a, self.r = key[keep, 0], key[keep, 1], key[keep, 2]
-        self.p = p_sum[keep] / p_sum[keep].sum()
+        total = p_sum[keep].sum() + self.waiting
+        self.p, self.waiting = p_sum[keep] / total, self.waiting / total
+        if 0 < self.waiting < 0.5:
+            # the music has more likely started than not: commit to it, so that music the
+            # chroma model explains poorly is not re-read as the silence before it
+            self.p, self.waiting = self.p / self.p.sum(), 0.0
         self.x, self.P = x_mean[keep], P_mean[keep]
         self.w = w_sum[keep] / p_sum[keep, None]
 
+        if self.waiting > 0 and not len(self.p):
+            self.input_index += 1
+            return
         tempos = np.exp(self.x @ TEMPO)
         self._position, route = estimate_chord_position(
             self.onset_beats, self.lengths, self.k, self.a, self.r, self.p, self.w,
