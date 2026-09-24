@@ -46,7 +46,7 @@ from matchmaker.prob.imm import interact, iterated_kalman_update, kalman_update,
 from matchmaker.prob.skf import MAX_HYPOTHESES, PROB_FLOOR, build_chord_sequence
 from matchmaker.utils.misc import set_latency_stats
 
-MODE_NAMES = ("cv", "ca", "zv", "free", "outlier")
+MODE_NAMES = ("cv", "ca", "zv", "free", "outlier", "jump")
 BLOCKS = 3      # each dynamics mode plays, holds (ZV) or runs free
 N_CHROMA = 12
 SILENCE_PEAKINESS = 2.0
@@ -88,6 +88,33 @@ OUTLIER_PRIOR, OUTLIER_SPREAD = 0.03, 1.5
 
 FREE_START = re.compile(r"ad lib|cadenza|a piacere|senza tempo|eingang", re.IGNORECASE)
 FREE_END = re.compile(r"a tempo|in tempo|tempo i\b|tempo primo", re.IGNORECASE)
+
+
+SECTION_BARLINES = ("light-light", "light-heavy", "heavy-light", "heavy-heavy")
+
+
+def junctions(score_part, onset_beats):
+    """Chords where the notation opens a section whose tempo may differ: after a double bar,
+    at a key, time signature or tempo change, at a tempo word (rit., accel., a tempo, ...),
+    and after a fermata."""
+    junction = np.zeros(len(onset_beats), dtype=bool)
+    if score_part is None:
+        return junction
+    beat = lambda t: float(score_part.beat_map(t))
+    at = lambda b: min(int(np.searchsorted(onset_beats, b - 1e-6)), len(onset_beats) - 1)
+    marks = [o.start.t for o in score_part.iter_all(pt.score.Barline) if getattr(o, "style", None) in SECTION_BARLINES]
+    for cls in (pt.score.KeySignature, pt.score.TimeSignature, pt.score.Tempo):
+        marks += [o.start.t for o in score_part.iter_all(cls)]
+    marks += [o.start.t for o in score_part.iter_all(pt.score.TempoDirection, include_subclasses=True)]
+    for t in marks:
+        b = beat(t)
+        if b > onset_beats[0] + 1e-6:
+            junction[at(b)] = True
+    for f in score_part.iter_all(pt.score.Fermata):
+        if getattr(f.ref, "start", None) is not None:
+            k = at(beat(f.ref.start.t))
+            junction[min(k + 1, len(onset_beats) - 1)] = True
+    return junction
 
 
 def free_spans(score_part, onset_beats):
@@ -140,7 +167,8 @@ class IMMChordFollower(OnlineAlignment):
         if not set(modes) <= set(MODE_NAMES) or "cv" not in modes:
             raise ValueError("modes must include 'cv' and be drawn from %s" % (MODE_NAMES,))
         fit = fit or (IMM_FIT if "ca" in modes else SINGLE_FIT)
-        self.jitter, self.spread, self.base_drift = fit["jitter"], fit["spread"], fit["base_drift"]
+        self.jitter, self.spread = fit["jitter"], fit["spread"]
+        self.base_drift = np.broadcast_to(np.asarray(fit["base_drift"], dtype=float), (len(fit["reversion"]),))
         self.reversion = np.array(fit["reversion"], dtype=float)
         self.deviation = np.array(fit["deviation"], dtype=float)
         self.target = np.array(fit.get("target", np.zeros(len(self.reversion))), dtype=float)
@@ -183,6 +211,12 @@ class IMMChordFollower(OnlineAlignment):
         self.free_prior = (free_spans(score_part, self.onset_beats) & ("free" in modes)).astype(float)
         self.hold_prior = np.where(fermata & self.hold_enabled, HOLD_PRIOR, 0.0) * (1 - self.free_prior)
         self.robust_update = "outlier" in modes
+        # a section may start at a new tempo: at a notated junction the last dynamics mode
+        # (JUMP) is entered with probability jump_prior and reopens the base as at the opening
+        self.jump = "jump" in modes
+        self.junction = junctions(score_part, self.onset_beats) & self.jump
+        self.jump_prior = fit.get("jump_prior", 0.5)
+        self.jump_sd = fit.get("jump_sd", TEMPO_PRIOR_SD)
 
         self.marked_tempo = 240.0 / tempo
         self.beat_seconds = 60.0 / tempo
@@ -389,11 +423,24 @@ class IMMChordFollower(OnlineAlignment):
         mu = mass[..., 0] / mass[..., 0].sum(axis=1, keepdims=True)
         return x_end, P_end, mu
 
-    def _start_chord(self, x, P, mu, length):
+    def _start_chord(self, x, P, mu, chords):
         """IMM interaction over the modes available on the chord that starts, then each mode's
         prediction over its notated length."""
+        length = self.lengths[chords]
         models = [self._prediction_model(l) for l in length.tolist()]
         transition, F, B, Q = (np.stack(parts) for parts in zip(*models))
+        if self.jump:
+            # JUMP is only reachable at a junction; there every mode enters it with jump_prior
+            J, at = self.D - 1, self.junction[chords][:, None, None]
+            closed = transition.copy()
+            closed[..., 0] += closed[..., J]
+            closed[..., J] = 0.0
+            closed[:, J, :] = transition[:, J, :]
+            opened = (1 - self.jump_prior) * closed
+            opened[..., J] += self.jump_prior
+            transition = np.where(at, opened, closed)
+            Q = Q.copy()
+            Q[:, J, 0, 0] += np.where(at[:, 0, 0], self.jump_sd ** 2, 0.0)
         if self.gated:
             expected = length * np.exp(np.einsum("hm,hm->h", mu, x @ TEMPO))
             informative = expected >= self.jitter / self.spread
@@ -471,7 +518,7 @@ class IMMChordFollower(OnlineAlignment):
             landing = np.where(ended, origin, target)
             x_end, P_end, mu_end = self._end_chord(self.x[parent[src]], self.P[parent[src]], mode_end, played,
                                                    self.a[parent[src]] * self.delta)
-            x_land, P_land, dyn = self._start_chord(x_end, P_end, mu_end, self.lengths[landing])
+            x_land, P_land, dyn = self._start_chord(x_end, P_end, mu_end, landing)
             # a new tempo marking is a known input: shift the base by the marked ratio and
             # reopen its uncertainty to that of an opening tempo relative to its marking
             changed = self.mark_bpm[origin] != self.mark_bpm[landing]
