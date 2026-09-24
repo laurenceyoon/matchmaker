@@ -61,9 +61,10 @@ TEMPO = np.array([1.0, 1.0])     # u = b + e: the observation direction of the s
 # to the duration, BASE_DRIFT the variance of the base per whole note, REVERSION the
 # deviation's reversion length (whole notes) and DEVIATION its stationary variance.
 JITTER, SPREAD, BASE_DRIFT, REVERSION, DEVIATION = 0.05, 0.2, 1e-4, 0.5, 0.01
-# CA targets and the modes' mean residences (whole notes), fitted on the same durations
+# CA targets and the mean residences (whole notes) of CV and of a tempo change (CA, and
+# JUMP, which shares CA's), fitted on the same durations
 CA_TARGET = 0.1
-RESIDENCE = {"cv": 32.0, "ca": 2.0, "jump": 1.0}
+RESIDENCE = {"cv": 32.0, "ca": 2.0, "jump": 2.0}
 # Across the validation split's junctions the log tempo ratio of the measures after and before
 # has a robust sd of 0.175 (0.062 at other barlines), and 46% change tempo by more than 15%
 JUMP_SD, JUMP_PRIOR = 0.175, 0.46
