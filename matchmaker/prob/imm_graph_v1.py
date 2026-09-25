@@ -171,7 +171,7 @@ class IMMGraphFollowerV1(OnlineAlignment):
         return np.r_[self.log_reference @ y, logsumexp(self.log_rest @ y) - np.log(len(self.log_rest))]
 
     def _heard(self, log_frames, frame):
-        """Softmin-pooled log-likelihood of the rendered frame and its neighbours."""
+        """Log of the averaged likelihood of the rendered frame and its two neighbours."""
         window = np.stack([log_frames[np.clip(frame + d, 0, len(log_frames) - 2)] for d in (-1, 0, 1)])
         return logsumexp(window, axis=0) - np.log(3.0)
 
