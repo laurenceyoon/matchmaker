@@ -257,17 +257,6 @@ methods:
       default_kwargs:
         processor: chroma_onset
 
-    imm_graph_v1:
-      class: matchmaker.prob.imm_graph_v1:IMMGraphFollowerV1
-      reference: score_audio
-      args:
-        <<: *oltw_frame_args
-        note_array: {from: note_array}
-        score_graph: {from: score_graph}
-        score_part: {from: score_part}
-        tempo: {from: tempo}
-      config_passthrough: true
-
     pfkorz:
       class: matchmaker.prob.particle_filter_korzeniowski:ParticleFilterKorzeniowski
       reference: korzeniowski_score_model

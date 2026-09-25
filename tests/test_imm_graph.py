@@ -1,9 +1,32 @@
 import numpy as np
+import partitura as pt
 import pytest
 
 from matchmaker.graph.score_graph import ScoreDirectedGraphBuilder
 from matchmaker.prob.imm_graph import IMMGraphFollower
-from tests.test_imm_graph_v1 import FRAMES_PER_CHORD, _chord_pitches, _chroma, _repeat_part
+
+FRAMES_PER_CHORD = 15  # one-beat chords at 120 bpm
+
+
+def _repeat_part():
+    part = pt.score.Part("P1", quarter_duration=1)
+    for i in range(3):
+        part.add(pt.score.Measure(number=i + 1), i * 4, (i + 1) * 4)
+    part.add(pt.score.Repeat(), 0, 8)
+    for i in range(12):
+        part.add(pt.score.Note(id=f"n{i}", step="CDEFGAB"[i % 7], octave=4), i, i + 1)
+    return part
+
+
+def _chord_pitches(note_array):
+    order = np.argsort(note_array["onset_beat"], kind="stable")
+    return [int(p) for p in note_array["pitch"][order]]
+
+
+def _chroma(pitch_class):
+    frame = np.zeros(12, dtype=np.float32)
+    frame[pitch_class] = 1.0
+    return frame
 
 
 def _follower(part, onset=False, **kwargs):

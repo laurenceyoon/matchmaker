@@ -352,7 +352,6 @@ Default method: `"arzt"`
 | `"arzt_tempo"` | On-line time warping by Arzt with a tempo model (Arzt and Widmer, 2010) |
 | `"arzt_multi_fold"` | Arzt OLTW tracking several unfolded score variants in parallel |
 | `"imm_graph"` | Chord-state switching Kalman follower with IMM tempo modes and a measure graph |
-| `"imm_graph_v1"` | Previous `imm_graph` (frame-mixed CV/CA/ZV on seconds per whole note), kept to reproduce earlier results |
 
 `imm_graph` (`matchmaker/prob/imm_graph.py`) follows a beam of chord-state
 hypotheses whose tempo is tracked by a constant-velocity / constant-acceleration /
