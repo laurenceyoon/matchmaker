@@ -3,14 +3,21 @@
 """
 Parallel Multi-Fold Online Time Warping (OLTWArztMultiFold)
 
-Implements the multi-hypothesis structure model score follower from:
-  Arzt & Widmer (2010) "Robust Real-Time Music Tracking" (Vienna Talk 2010)
-  Arzt & Widmer (2010) "Towards Effective 'Any-Time' Music Tracking" (STAIRS 2010)
+A baseline for folded scores with repeats. The score is unfolded into a few versions
+(every repeat taken, the folded score itself, and the first four versions partitura's
+``iter_unfolded_parts`` yields, duplicates removed); one frame-level Arzt OLTW matcher
+(``OnlineTimeWarpingArztFrame``) runs on each version from the start, and the output, in
+notated (folded) beats, is the matcher whose local matching cost averaged over the last
+``selection_window`` frames is lowest, switching only when another is lower by
+``switch_margin``.
 
-This follower generates all possible unfolded structural variants (fold clones)
-of a folded MusicXML score with repeats, maintains parallel OnlineTimeWarpingArztFrame
-trackers for each hypothesis, and uses a Decision Maker based on running alignment
-cost to select the winning hypothesis and output the notated (folded) score position.
+The idea of running several OLTW matchers in parallel and comparing their alignment costs
+is adapted from
+  A. Arzt, G. Widmer and S. Dixon, "Automatic page turning for musicians via real-time
+      machine listening", Proc. ECAI, 2008 (Strategy 3)
+  G. Widmer and A. Arzt, "Robust real-time music tracking", Proc. Vienna Talk, 2010.
+The unfolded versions, the cost window and the switching margin are this implementation's
+own choices, not those papers'.
 """
 
 from __future__ import annotations
@@ -55,7 +62,7 @@ class OnlineTimeWarpingArztMultiFold(OnlineTimeWarpingArztFrame):
     processor : Processor
         Audio feature processor (e.g. ChromaProcessor).
     frame_rate : int
-        Audio frame rate (default: 50).
+        Audio frame rate (default: FRAME_RATE, 30).
     window_size : int
         Search window size in seconds (default: 10).
     step_size : int
@@ -64,7 +71,7 @@ class OnlineTimeWarpingArztMultiFold(OnlineTimeWarpingArztFrame):
         Window size during warmup (default: 0.1).
     selection_window : int
         Number of trailing frames over which running matching cost is averaged
-        for hypothesis selection (default: 50 frames ~ 1.0 s).
+        for hypothesis selection (default: 50 frames, about 1.7 s at 30 fps).
     switch_margin : float
         Hysteresis factor requiring an alternative hypothesis to have cost
         strictly lower by this fraction before switching (default: 0.05).
