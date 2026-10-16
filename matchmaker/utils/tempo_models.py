@@ -819,14 +819,37 @@ class ArztTempoModel(TempoModel):
 ArztWidmer2010TempoModel = ArztTempoModel
 
 
+def _get_anchor_tempo_model():
+    from matchmaker.models.oltw_anchor_tempo import AnchorTempoModel
+
+    return AnchorTempoModel
+
+
+# Lazy or direct reference for AnchorTempoModel
+try:
+    from matchmaker.models.oltw_anchor_tempo import AnchorTempoModel
+except ImportError:
+    AnchorTempoModel = None
+
+
 def make_tempo_model(tempo_model, **kwargs) -> Optional[TempoModel]:
-    """None, a ``TempoModel`` instance, or a class (built with ``kwargs``)."""
+    """None, a ``TempoModel`` instance, a class, or a string alias (e.g. 'arzt', 'anchor')."""
     if tempo_model is None or isinstance(tempo_model, TempoModel):
         return tempo_model
+    if isinstance(tempo_model, str):
+        key = tempo_model.lower().strip()
+        if key in ("arzt", "arzt_tempo"):
+            return ArztTempoModel(**kwargs)
+        elif key in ("anchor", "anchor_tempo"):
+            cls = AnchorTempoModel or _get_anchor_tempo_model()
+            return cls(**kwargs)
+        raise ValueError(
+            f"Unknown tempo_model alias '{tempo_model}'. Supported: 'arzt', 'anchor'"
+        )
     if isinstance(tempo_model, type) and issubclass(tempo_model, TempoModel):
         return tempo_model(**kwargs)
     raise TypeError(
-        f"tempo_model must be None, a TempoModel or its class, got {tempo_model!r}"
+        f"tempo_model must be None, a TempoModel, its class, or a recognized string, got {tempo_model!r}"
     )
 
 

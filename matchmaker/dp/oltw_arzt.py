@@ -445,24 +445,32 @@ class OnlineTimeWarpingArztFrame(OnlineTimeWarpingArzt):
         return max(0, min(idx, len(self.score_positions) - 1))
 
     def get_current_position(self) -> float:
-        if self.tempo_model is not None and self.input_index > 5:
-            x, y = self.input_index - 1, self._current_frame
-            path = [(x, y)]
-            for bx, by in self.tempo_backward_path(x, y):
-                path.append((bx, by))
-                if len(path) >= 3:
-                    break
-            if len(path) >= 2:
-                bx, by = path[-1]
-                dx = x - bx
-                tempo = self.tempo_model.current_tempo
-                pred_y = by + dx * tempo
-                return float(
-                    self._frame_to_beat(
-                        int(round(np.clip(pred_y, 0, len(self._ref_frame_to_beat) - 1)))
+        raw_beat = self._frame_to_beat(self._current_frame)
+        if self.tempo_model is not None:
+            if hasattr(self.tempo_model, "guide_position"):
+                return float(self.tempo_model.guide_position(self, raw_beat))
+            if self.input_index > 5:
+                x, y = self.input_index - 1, self._current_frame
+                path = [(x, y)]
+                for bx, by in self.tempo_backward_path(x, y):
+                    path.append((bx, by))
+                    if len(path) >= 3:
+                        break
+                if len(path) >= 2:
+                    bx, by = path[-1]
+                    dx = x - bx
+                    tempo = self.tempo_model.current_tempo
+                    pred_y = by + dx * tempo
+                    return float(
+                        self._frame_to_beat(
+                            int(
+                                round(
+                                    np.clip(pred_y, 0, len(self._ref_frame_to_beat) - 1)
+                                )
+                            )
+                        )
                     )
-                )
-        return self._frame_to_beat(self._current_frame)
+        return raw_beat
 
     def _init_distance_func(self, distance_func):
         if not (isinstance(distance_func, (str, tuple)) or callable(distance_func)):

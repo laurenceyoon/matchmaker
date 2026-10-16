@@ -182,6 +182,19 @@ methods:
         step_size: 3
         tempo_model: !obj matchmaker.utils.tempo_models:ArztTempoModel
 
+    arzt_anchor_tempo:
+      family: oltw
+      class: matchmaker.dp:OnlineTimeWarpingArztFrame
+      reference: score_audio
+      args: *oltw_frame_args
+      config_passthrough: true
+      default_kwargs:
+        processor: chroma
+        window_size: 10
+        start_window_size: 0.1
+        step_size: 3
+        tempo_model: !obj matchmaker.models.oltw_anchor_tempo:AnchorTempoModel
+
     arzt_multi_fold:
       family: oltw
       class: matchmaker.dp:OnlineTimeWarpingArztMultiFold
