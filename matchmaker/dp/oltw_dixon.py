@@ -28,6 +28,7 @@ from matchmaker.features.audio import FRAME_RATE
 from matchmaker.io.audio import QUEUE_TIMEOUT
 from matchmaker.io.queue import RECVQueue
 from matchmaker.utils.misc import set_latency_stats
+from matchmaker.utils.tempo_models import make_tempo_model
 
 
 class Direction(IntEnum):
@@ -122,6 +123,7 @@ class OnlineTimeWarpingDixonFrame(OnlineTimeWarpingDixon):
         max_run_count=MAX_RUN_COUNT,
         frame_rate=FRAME_RATE,
         ref_frame_to_beat: NDArray = None,
+        tempo_model=None,
         **kwargs,
     ):
         if ref_frame_to_beat is None:
@@ -140,6 +142,7 @@ class OnlineTimeWarpingDixonFrame(OnlineTimeWarpingDixon):
         self._ref_frame_to_beat = ref_frame_to_beat
         self.w = int(window_size * self.frame_rate)
         self.queue_timeout = QUEUE_TIMEOUT
+        self.tempo_model = make_tempo_model(tempo_model)
         self.reset()
 
     def reset(self):
@@ -163,6 +166,8 @@ class OnlineTimeWarpingDixonFrame(OnlineTimeWarpingDixon):
         }
         self._initialized = False
         self._pending = []  # input frames received but not yet consumed
+        if getattr(self, "tempo_model", None) is not None:
+            self.tempo_model.reset(self)
 
     def _frame_to_beat(self, frame: int) -> float:
         return float(
@@ -174,8 +179,15 @@ class OnlineTimeWarpingDixonFrame(OnlineTimeWarpingDixon):
         idx = int(np.searchsorted(self.score_positions, beat, side="right") - 1)
         return max(0, min(idx, len(self.score_positions) - 1))
 
+    @property
+    def _current_frame(self) -> int:
+        return self.best_ref
+
     def get_current_position(self) -> float:
-        return self._frame_to_beat(self.best_ref)
+        raw_beat = self._frame_to_beat(self.best_ref)
+        if self.tempo_model is not None and hasattr(self.tempo_model, "guide_position"):
+            return float(self.tempo_model.guide_position(self, raw_beat))
+        return raw_beat
 
     @property
     def alignment_path(self) -> NDArray:
@@ -359,6 +371,9 @@ class OnlineTimeWarpingDixonFrame(OnlineTimeWarpingDixon):
         self.input_index += 1
 
     def step(self, input_features):
+        if self.tempo_model is not None and self.input_index > 0:
+            self.tempo_model.before_step(self)
+
         if not self._initialized:
             self.initialize(input_features)
             return
@@ -415,6 +430,7 @@ class OnlineTimeWarpingDixonEvent(OnlineTimeWarpingDixon):
         window_size: int = 30,
         max_run_count: int = MAX_RUN_COUNT,
         distance_func: str = "euclidean",
+        tempo_model=None,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -425,6 +441,7 @@ class OnlineTimeWarpingDixonEvent(OnlineTimeWarpingDixon):
             distance_func=distance_func,
             **kwargs,
         )
+        self.tempo_model = make_tempo_model(tempo_model)
         self.ref = self.reference_features.astype(np.float32)
         self.w = window_size
         self.reset()
@@ -447,6 +464,21 @@ class OnlineTimeWarpingDixonEvent(OnlineTimeWarpingDixon):
             "max_latency": 0,
             "min_latency": float("inf"),
         }
+        if getattr(self, "tempo_model", None) is not None:
+            self.tempo_model.reset(self)
+
+    @property
+    def _current_frame(self) -> int:
+        return self.current_index
+
+    def _frame_to_beat(self, frame: int) -> float:
+        return float(self.score_positions[min(frame, len(self.score_positions) - 1)])
+
+    def get_current_position(self) -> float:
+        raw_beat = float(self.score_positions[self.current_index])
+        if self.tempo_model is not None and hasattr(self.tempo_model, "guide_position"):
+            return float(self.tempo_model.guide_position(self, raw_beat))
+        return raw_beat
 
     # ---- cost matrix (sparse) ----
 
@@ -533,6 +565,8 @@ class OnlineTimeWarpingDixonEvent(OnlineTimeWarpingDixon):
             self.run_count_ref = 0
 
     def step(self, input_feat: NDArray[np.float32]) -> None:
+        if self.tempo_model is not None and self.input_index > 0:
+            self.tempo_model.before_step(self)
         self._pending.append(np.asarray(input_feat, dtype=np.float32))
         if self.t < 0:
             self._inputs.append(self._pending.pop(0))

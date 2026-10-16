@@ -604,6 +604,7 @@ class OnlineTimeWarpingArztEvent(OnlineTimeWarpingArzt):
         step_size: int = 5,
         start_window_size: int = 5,
         distance_func: str = "cosine",
+        tempo_model=None,
         queue: Optional[RECVQueue] = None,
         **kwargs,
     ) -> None:
@@ -616,9 +617,30 @@ class OnlineTimeWarpingArztEvent(OnlineTimeWarpingArzt):
             queue=queue,
             **kwargs,
         )
+        self.tempo_model = make_tempo_model(tempo_model)
         self._window_size = window_size
         self._start_window_size = start_window_size
         self._scipy_metric = distance_func
+        if self.tempo_model is not None:
+            self.tempo_model.reset(self)
+
+    def reset(self) -> None:
+        super().reset()
+        if getattr(self, "tempo_model", None) is not None:
+            self.tempo_model.reset(self)
+
+    @property
+    def _current_frame(self) -> int:
+        return self.current_index
+
+    def _frame_to_beat(self, frame: int) -> float:
+        return float(self.score_positions[min(frame, len(self.score_positions) - 1)])
+
+    def get_current_position(self) -> float:
+        raw_beat = float(self.score_positions[self.current_index])
+        if self.tempo_model is not None and hasattr(self.tempo_model, "guide_position"):
+            return float(self.tempo_model.guide_position(self, raw_beat))
+        return raw_beat
 
     def get_window(self) -> Tuple[int, int]:
         w = self._window_size
@@ -629,6 +651,8 @@ class OnlineTimeWarpingArztEvent(OnlineTimeWarpingArzt):
         return start, end
 
     def step(self, input_features: NDArray[np.float32]) -> None:
+        if self.tempo_model is not None and self.input_index > 0:
+            self.tempo_model.before_step(self)
         feat = np.asarray(input_features, dtype=np.float32).squeeze()
 
         window_start, window_end = self.get_window()

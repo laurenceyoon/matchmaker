@@ -224,6 +224,18 @@ methods:
         window_size: 10
         frame_rate: 50
 
+    dixon_anchor_tempo:
+      family: oltw
+      class: matchmaker.dp:OnlineTimeWarpingDixonFrame
+      reference: score_audio
+      args: *oltw_frame_args
+      config_passthrough: true
+      default_kwargs:
+        processor: lse
+        window_size: 10
+        frame_rate: 50
+        tempo_model: !obj matchmaker.models.oltw_anchor_tempo:AnchorTempoModel
+
     outerhmm:
       class: matchmaker.prob:AudioOuterProductHMM
       args:
@@ -293,6 +305,21 @@ methods:
         start_window_size: 2
         step_size: 5
 
+    arzt_anchor_tempo:
+      family: oltw
+      class: matchmaker.dp:OnlineTimeWarpingArztEvent
+      args: *oltw_event_args
+      config_passthrough:
+        exclude: [piano_range, window_size, start_window_size]
+      default_kwargs:
+        processor: chord_onset
+        piano_range: true
+        polling_period: 0.001
+        window_size: 2
+        start_window_size: 2
+        step_size: 5
+        tempo_model: !obj matchmaker.models.oltw_anchor_tempo:AnchorTempoModel
+
     dixon:
       family: oltw
       class: matchmaker.dp:OnlineTimeWarpingDixonEvent
@@ -304,6 +331,19 @@ methods:
         piano_range: true
         polling_period: 0.001
         window_size: 30
+
+    dixon_anchor_tempo:
+      family: oltw
+      class: matchmaker.dp:OnlineTimeWarpingDixonEvent
+      args: *oltw_event_args
+      config_passthrough:
+        exclude: [piano_range]
+      default_kwargs:
+        processor: chord_onset
+        piano_range: true
+        polling_period: 0.001
+        window_size: 30
+        tempo_model: !obj matchmaker.models.oltw_anchor_tempo:AnchorTempoModel
 
     hmm:
       class: matchmaker.prob:PitchIOIHMM
@@ -317,6 +357,20 @@ methods:
       default_kwargs:
         processor: pitch
         tempo_model: !obj matchmaker.utils.tempo_models:KalmanTempoModel
+        piano_range: true
+
+    hmm_anchor_tempo:
+      class: matchmaker.prob:PitchIOIHMM
+      args:
+        reference_features: {from: reference_features}
+        queue: {from: queue}
+        has_insertions: true
+      config_passthrough: true
+      processor_args:
+        return_pitch_list: true
+      default_kwargs:
+        processor: pitch
+        tempo_model: !obj matchmaker.models.oltw_anchor_tempo:AnchorTempoModel
         piano_range: true
 
     pthmm:
